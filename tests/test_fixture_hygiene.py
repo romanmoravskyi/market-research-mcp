@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import gzip
 import re
+import urllib.parse
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,11 @@ FORBIDDEN = {
     "api_key=": re.compile(rb"api_key=", re.IGNORECASE),
     "token=": re.compile(rb"token=", re.IGNORECASE),
     "User-Agent": re.compile(rb"user-agent", re.IGNORECASE),
+    # Tiingo sends `Authorization: Token <key>`, Finnhub sends `X-Finnhub-Token: <key>`.
+    "Authorization header": re.compile(rb"authorization\s*:", re.IGNORECASE),
+    "X-Finnhub-Token": re.compile(rb"x-finnhub-token", re.IGNORECASE),
+    "apikey": re.compile(rb"apikey", re.IGNORECASE),
+    "key/token field": re.compile(rb"\"(?:api_?key|key|token)\"\s*:", re.IGNORECASE),
 }
 # RFC 2606 reserved domains, safe for placeholders.
 RESERVED_EMAIL_DOMAINS = (b"example.com", b"example.org", b"example.net")
@@ -40,7 +46,9 @@ def read_fixture(path: Path) -> bytes:
 def find_violations(name: str, data: bytes) -> list[str]:
     """Return a description of each hygiene problem in one fixture's content."""
     problems: list[str] = []
-    for match in EMAIL.finditer(data):
+    # Also scan the percent-decoded text: emails leak into query strings as `%40`.
+    decoded = urllib.parse.unquote_to_bytes(data)
+    for match in [*EMAIL.finditer(data), *EMAIL.finditer(decoded)]:
         email = match.group(0)
         domain = email.rsplit(b"@", 1)[1].lower()
         if email.lower() in PUBLIC_EMAILS or domain in RESERVED_EMAIL_DOMAINS:
@@ -58,6 +66,13 @@ def fixture_files() -> list[Path]:
     return sorted(p for p in FIXTURES.rglob("*") if p.is_file())
 
 
+def test_fixtures_exist() -> None:
+    # Guards against the parametrized scan below silently collecting zero cases.
+    files = fixture_files()
+    assert len(files) > 10
+    assert any(p.suffix == ".gz" for p in files)
+
+
 @pytest.mark.parametrize("path", fixture_files(), ids=lambda p: p.relative_to(FIXTURES).as_posix())
 def test_fixture_is_clean(path: Path) -> None:
     # Report only the kind of problem, never the matched value.
@@ -71,6 +86,12 @@ def test_fixture_is_clean(path: Path) -> None:
         (b"https://api.example.test/x?api_key=abc123", ["api_key="]),
         (b"https://api.example.test/x?token=abc123", ["token="]),
         (b"User-Agent: Jane Doe", ["User-Agent"]),
+        (b"https://api.example.test/x?ua=jane.doe%40mail.test", ["email address"]),
+        (b"Authorization: Token abc123", ["Authorization header"]),
+        (b"x-finnhub-token: abc123", ["X-Finnhub-Token"]),
+        (b"https://api.example.test/x?apikey=abc123", ["apikey"]),
+        (b'{"token": "abc123"}', ["key/token field"]),
+        (b'{"api_key": "abc123"}', ["key/token field"]),
     ],
 )
 def test_detects_injected_sample(sample: bytes, expected: list[str]) -> None:

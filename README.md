@@ -14,7 +14,7 @@ earnings dates. It ships as a Claude Code plugin with an `analyze-ticker` skill.
 
 - [uv](https://docs.astral.sh/uv/getting-started/installation/). uv installs Python 3.12+ for
   you from `.python-version`; no system Python needed.
-- Git, to clone the repository (not needed for the plugin install).
+- Git. Both the clone and the Claude Code plugin install fetch this repository with git.
 
 ## Keys
 
