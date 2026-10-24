@@ -8,6 +8,7 @@ Files:
 - `<ID>_series.json` and `<ID>_observations.json` for DGS10 and CPIAUCSL
   (each observations file contains one `"."` missing value).
 - `error_unknown_series.json`: the HTTP 400 body FRED returns for an unknown series id.
+- `error_bad_api_key.json`: the HTTP 400 body FRED returns for an unregistered `api_key`.
 
 To replace them with real recordings (needs `FRED_API_KEY`):
 

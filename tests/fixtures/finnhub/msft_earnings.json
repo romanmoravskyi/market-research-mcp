@@ -1,0 +1,26 @@
+{
+  "earningsCalendar": [
+    {
+      "symbol": "MSFT",
+      "date": "2027-01-21",
+      "hour": "",
+      "quarter": 2,
+      "year": 2027,
+      "epsEstimate": 1.2345,
+      "epsActual": null,
+      "revenueEstimate": 12345678901,
+      "revenueActual": null
+    },
+    {
+      "symbol": "MSFT",
+      "date": "2026-11-03",
+      "hour": "amc",
+      "quarter": 1,
+      "year": 2027,
+      "epsEstimate": 2.3456,
+      "epsActual": null,
+      "revenueEstimate": 23456789012,
+      "revenueActual": null
+    }
+  ]
+}

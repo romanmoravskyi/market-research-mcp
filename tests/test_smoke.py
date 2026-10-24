@@ -20,6 +20,27 @@ async def test_ping_registered_and_returns_fields():
     assert datetime.fromisoformat(result["retrieved_at"]).tzinfo is not None
 
 
+EXPECTED_TOOLS = {
+    "ping",
+    "resolve_ticker",
+    "list_filings",
+    "get_filing_section",
+    "get_filing_exhibit",
+    "get_insider_transactions",
+    "get_fundamentals",
+    "get_price_history",
+    "get_price_stats",
+    "get_earnings_calendar",
+    "get_macro_series",
+}
+
+
+async def test_full_tool_set_registered():
+    mcp = build_server()
+    tools = {t.name for t in await mcp.list_tools()}
+    assert EXPECTED_TOOLS <= tools, f"missing: {sorted(EXPECTED_TOOLS - tools)}"
+
+
 def test_require_raises_naming_var(monkeypatch):
     monkeypatch.delenv("FRED_API_KEY", raising=False)
     with pytest.raises(ConfigError, match="FRED_API_KEY"):

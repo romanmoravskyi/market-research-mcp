@@ -187,3 +187,36 @@ async def test_live_dgs10(env, monkeypatch):
     assert dgs.id == "DGS10" and dgs.units == "Percent"
     assert 1 <= len(dgs.observations) <= 5
     assert real_key not in dgs.model_dump_json()
+
+
+@respx.mock
+async def test_bad_api_key_is_config_error(respx_mock):
+    respx_mock.get(SERIES_URL).mock(
+        return_value=httpx.Response(400, json=load("error_bad_api_key.json"))
+    )
+    with pytest.raises(ConfigError, match="FRED_API_KEY") as ei:
+        await fred.get_macro_series(["DGS10"])
+    assert SECRET not in str(ei.value)
+
+
+@respx.mock
+async def test_series_fetched_concurrently_order_preserved(respx_mock):
+    import asyncio
+
+    second_started = asyncio.Event()
+    routes = mock_fred(respx_mock)
+    dgs_side = routes[("DGS10", "series")].return_value
+    cpi_side = routes[("CPIAUCSL", "series")].return_value
+
+    async def slow_first(request):
+        await second_started.wait()  # deadlocks if series are fetched one after another
+        return dgs_side
+
+    async def mark_second(request):
+        second_started.set()
+        return cpi_side
+
+    routes[("DGS10", "series")].side_effect = slow_first
+    routes[("CPIAUCSL", "series")].side_effect = mark_second
+    result = await asyncio.wait_for(fred.get_macro_series(["DGS10", "CPIAUCSL"]), timeout=5)
+    assert [s.id for s in result] == ["DGS10", "CPIAUCSL"]

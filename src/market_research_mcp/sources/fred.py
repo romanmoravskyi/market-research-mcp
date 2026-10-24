@@ -7,6 +7,8 @@ every `source_url` returned here is the public series page, which carries no key
 
 from __future__ import annotations
 
+import asyncio
+import json
 import re
 from datetime import date
 
@@ -14,7 +16,7 @@ from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel
 
 from market_research_mcp import http
-from market_research_mcp.config import require
+from market_research_mcp.config import ConfigError, require
 from market_research_mcp.errors import BadInput, NotFound, ProviderDown
 from market_research_mcp.models import Sourced
 
@@ -78,6 +80,17 @@ def _value(raw: object) -> float | None:
         return None
 
 
+def _error_message(body: str | None) -> str:
+    """FRED's `error_message` from an error body (the raw text if it is not JSON)."""
+    if not body:
+        return ""
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return body
+    return str(data.get("error_message", "")) if isinstance(data, dict) else body
+
+
 async def _get(path: str, sid: str, params: dict[str, str | int], key: str) -> http.FetchResult:
     cache_key = f"{path}:" + "&".join(f"{k}={v}" for k, v in sorted(params.items()))
     try:
@@ -89,8 +102,14 @@ async def _get(path: str, sid: str, params: dict[str, str | int], key: str) -> h
             cache_key=cache_key,
         )
     except ProviderDown as exc:
-        # FRED answers an unknown series id with HTTP 400 and an error_message body.
+        # FRED answers both an unknown series id and a bad api_key with HTTP 400; the
+        # error_message body tells them apart.
         if exc.detail == "HTTP 400":
+            if "api_key" in _error_message(exc.body):
+                raise ConfigError(
+                    "FRED rejected the API key: check FRED_API_KEY "
+                    "(get one at https://fred.stlouisfed.org/docs/api/api_key.html)."
+                ) from None
             raise NotFound(f"FRED series {sid}", "FRED") from None
         raise
     except NotFound:
@@ -151,7 +170,8 @@ async def get_macro_series(
     """
     ids = _validate(series_ids, start, limit)
     key = require("FRED_API_KEY")
-    return [await _one(sid, start, limit, key) for sid in ids]
+    # Concurrent; gather keeps input order. The shared FRED rate limiter still applies.
+    return list(await asyncio.gather(*(_one(sid, start, limit, key) for sid in ids)))
 
 
 def register(mcp: FastMCP) -> None:

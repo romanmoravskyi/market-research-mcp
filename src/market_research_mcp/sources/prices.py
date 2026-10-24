@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import math
-import re
 import statistics
 from datetime import date, timedelta
 from typing import Any, Protocol
@@ -24,6 +23,7 @@ from market_research_mcp.cache import seconds_until_next_us_close
 from market_research_mcp.config import ConfigError, get_settings, require
 from market_research_mcp.errors import BadInput, NotFound, ProviderDown
 from market_research_mcp.models import Sourced, utcnow
+from market_research_mcp.tickers import normalize_ticker
 
 __all__ = [
     "Bar",
@@ -40,11 +40,13 @@ __all__ = [
     "get_split_history",
     "max_drawdown",
     "period_return",
+    "normalize_ticker",
     "register",
+    "splits_from_bars",
 ]
 
 TIINGO_BASE = "https://api.tiingo.com/tiingo/daily"
-SPLITS_START = date(1962, 1, 1)  # far enough back to cover any listed history
+SPLIT_WINDOW_YEARS = 10  # default split lookback: covers the fundamentals horizon
 
 RETURN_WINDOWS = {"1m": 21, "3m": 63, "1y": 252, "5y": 1260}
 YEAR_BARS = 252
@@ -52,8 +54,6 @@ FIVE_YEAR_BARS = 1260
 MAX_LIMIT = 5000
 
 Date = date  # alias so model fields named `date` don't shadow the type
-
-_TICKER_RE = re.compile(r"^[A-Z0-9][A-Z0-9.\-]{0,14}$")
 
 
 # ---------------------------------------------------------------- models
@@ -127,17 +127,16 @@ class PriceProvider(Protocol):
 
     async def history(self, ticker: str, start: date, end: date) -> list[Bar]: ...
 
-    async def splits(self, ticker: str) -> list[Split]: ...
+    async def splits(self, ticker: str, start: date, end: date) -> list[Split]: ...
 
     def source_url(self, ticker: str) -> str: ...
 
 
-def normalize_ticker(ticker: str) -> str:
-    """Upper-case and validate a ticker. Dots become dashes (BRK.B -> BRK-B)."""
-    t = (ticker or "").strip().upper().replace(".", "-")
-    if not _TICKER_RE.match(t):
-        raise BadInput(f"ticker {ticker!r} is not a valid symbol (e.g. MSFT, BRK.B).")
-    return t
+def splits_from_bars(bars: list[Bar]) -> list[Split]:
+    """Splits recorded in already-fetched bars (split_factor != 1), oldest first."""
+    out = [Split(date=b.date, factor=b.split_factor) for b in bars if b.split_factor != 1.0]
+    out.sort(key=lambda s: s.date)
+    return out
 
 
 def _parse_date(value: str | None, field: str) -> date | None:
@@ -210,15 +209,19 @@ class TiingoProvider:
         bars.sort(key=lambda b: b.date)
         return bars
 
-    async def splits(self, ticker: str) -> list[Split]:
-        rows = await self._prices(ticker, SPLITS_START, None)
-        out = []
-        for r in rows:
-            factor = r.get("splitFactor")
-            if factor is not None and float(factor) != 1.0:
-                out.append(Split(date=date.fromisoformat(str(r["date"])[:10]), factor=factor))
-        out.sort(key=lambda s: s.date)
-        return out
+    async def splits(self, ticker: str, start: date, end: date) -> list[Split]:
+        # Same request (and cache key) as history(ticker, start, end): one HTTP call serves both.
+        # Parsed leniently: only date and splitFactor are needed, so missing OHLC is fine.
+        rows = await self._prices(ticker, start, end)
+        out: list[Split] = []
+        try:
+            for r in rows:
+                factor = _float(r.get("splitFactor")) or 1.0
+                if factor != 1.0:
+                    out.append(Split(date=date.fromisoformat(str(r["date"])[:10]), factor=factor))
+        except (AttributeError, KeyError, TypeError, ValueError) as exc:
+            raise ProviderDown(self.label, "unexpected response format", self.alternative) from exc
+        return sorted(out, key=lambda x: x.date)
 
 
 class YFinanceProvider:
@@ -274,10 +277,12 @@ class YFinanceProvider:
             )
         return bars
 
-    def _splits_blocking(self, ticker: str) -> list[Split]:
+    def _splits_blocking(self, ticker: str, start: date, end: date) -> list[Split]:
         series = self._yf.Ticker(ticker).splits
         return [
-            Split(date=idx.date(), factor=float(v)) for idx, v in series.items() if float(v) != 1.0
+            Split(date=idx.date(), factor=float(v))
+            for idx, v in series.items()
+            if float(v) != 1.0 and start <= idx.date() <= end
         ]
 
     async def history(self, ticker: str, start: date, end: date) -> list[Bar]:
@@ -286,9 +291,9 @@ class YFinanceProvider:
         except Exception as exc:  # yfinance raises many ad-hoc exception types
             raise ProviderDown(self.label, type(exc).__name__, self.alternative) from exc
 
-    async def splits(self, ticker: str) -> list[Split]:
+    async def splits(self, ticker: str, start: date, end: date) -> list[Split]:
         try:
-            return await asyncio.to_thread(self._splits_blocking, ticker)
+            return await asyncio.to_thread(self._splits_blocking, ticker, start, end)
         except Exception as exc:
             raise ProviderDown(self.label, type(exc).__name__, self.alternative) from exc
 
@@ -466,12 +471,30 @@ async def get_price_stats(ticker: str) -> PriceStats:
     )
 
 
-async def get_split_history(ticker: str) -> list[Split]:
+def _years_before(d: date, years: int) -> date:
+    try:
+        return d.replace(year=d.year - years)
+    except ValueError:  # 29 February
+        return d.replace(year=d.year - years, day=28)
+
+
+async def get_split_history(
+    ticker: str,
+    start: date | None = None,
+    end: date | None = None,
+) -> list[Split]:
     """Public helper (not an MCP tool): stock splits for `ticker`, oldest first.
 
-    Used by the XBRL module to adjust share counts. Uses the configured price provider.
+    Used by the XBRL module to adjust share counts, which only needs the fundamentals'
+    horizon, so the window defaults to the last 10 years (`start` = end - 10 years,
+    `end` = today) instead of the full listed history. With Tiingo, a call with the same
+    start/end as an earlier `history()` call is served from that cached response (no extra
+    HTTP); `splits_from_bars` derives splits from bars already fetched. Uses the configured
+    price provider.
     """
-    return await get_provider().splits(normalize_ticker(ticker))
+    end_d = end or _today()
+    start_d = start or _years_before(end_d, SPLIT_WINDOW_YEARS)
+    return await get_provider().splits(normalize_ticker(ticker), start_d, end_d)
 
 
 def register(mcp: FastMCP) -> None:
