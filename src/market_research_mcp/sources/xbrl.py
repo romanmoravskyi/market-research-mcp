@@ -8,8 +8,10 @@ Layers:
 - `normalize` maps facts to canonical metrics with ordered tag fallbacks, chosen per period.
 - `get_fundamentals` (the MCP tool) fetches companyfacts and calls `normalize`.
 
-Extension points for derived quarters (Q4 = FY - Q1..Q3, quarterly cash flow from YTD):
-add them to the quarterly branch of `duration_facts` and mark the new facts `derived=True`.
+Derived quarters (`derive_quarters`): fiscal Q4 (FY - 9M YTD, or FY - Q1 - Q2 - Q3) and
+discrete quarters from year-to-date 10-Q facts (Q2 = 6M - 3M, Q3 = 9M - 6M), for additive
+USD flow metrics only. Derived facts carry `derived=True` and a note naming the formula and
+the filings used.
 """
 
 from __future__ import annotations
@@ -36,6 +38,7 @@ __all__ = [
     "MetricSpec",
     "companyfacts_url",
     "dedupe",
+    "derive_quarters",
     "duration_facts",
     "fiscal_year_for",
     "get_fundamentals",
@@ -53,6 +56,8 @@ ARCHIVES_BASE = "https://www.sec.gov/Archives/edgar/data/"
 
 ANNUAL_DAYS = (350, 380)
 QUARTER_DAYS = (80, 100)
+HALF_YTD_DAYS = (170, 195)
+NINE_MONTH_YTD_DAYS = (260, 290)
 COVER_WINDOW_DAYS = 120  # cover-page share counts are dated weeks after the period end
 MAX_N = 40
 
@@ -63,6 +68,10 @@ PERIODIC_FORMS = ANNUAL_FORMS | QUARTERLY_FORMS
 NO_TAG = "no matching us-gaap tag"
 NO_DEI_TAG = "no matching dei tag"
 NO_VALUE = "no value reported for this period"
+NOT_ADDITIVE = (
+    "not reported for this quarter; per-share and average share values are not additive, "
+    "so they are not derived from year-to-date figures"
+)
 
 Periods = Literal["annual", "quarterly"]
 Kind = Literal["duration", "instant", "cover"]
@@ -173,6 +182,7 @@ class Fact:
     fy: int | None = None
     fp: str | None = None
     derived: bool = False
+    note: str | None = None
 
     @property
     def days(self) -> int | None:
@@ -243,10 +253,111 @@ def select_quarterly(facts: Iterable[Fact]) -> list[Fact]:
     ]
 
 
+def _in(days: int | None, band: tuple[int, int]) -> bool:
+    return days is not None and band[0] <= days <= band[1]
+
+
+def _cumulative_index(days: int | None) -> int | None:
+    """1, 2, 3 or 4 for a 3-, 6-, 9- or 12-month period from the fiscal-year start."""
+    for k, band in enumerate((QUARTER_DAYS, HALF_YTD_DAYS, NINE_MONTH_YTD_DAYS, ANNUAL_DAYS), 1):
+        if _in(days, band):
+            return k
+    return None
+
+
+_CUM_NAME = {1: "3M", 2: "6M YTD", 3: "9M YTD", 4: "FY"}
+
+
+def _derived_fact(template: Fact, start: date, end: date, terms: list[tuple[str, Fact]]) -> Fact:
+    """A derived quarter: first term minus the others. Sourced to the latest filing used."""
+    value = terms[0][1].value - sum(f.value for _, f in terms[1:])
+    if isinstance(value, float):
+        value = round(value, 6)
+    latest = max((f for _, f in terms), key=lambda f: (f.filed, f.accession))
+    formula = " - ".join(name for name, _ in terms)
+    used = "; ".join(
+        f"{name} from {f.form} {f.accession}" + (" (derived)" if f.derived else "")
+        for name, f in terms
+    )
+    return Fact(
+        concept=template.concept,
+        unit=template.unit,
+        start=start,
+        end=end,
+        value=value,
+        accession=latest.accession,
+        form=latest.form,
+        filed=latest.filed,
+        derived=True,
+        note=f"derived: {formula}; {used}",
+    )
+
+
+def derive_quarters(facts: Iterable[Fact], concepts: Iterable[str]) -> list[Fact]:
+    """Discrete quarters missing as 3-month facts, derived from cumulative facts.
+
+    For each fiscal year (cumulative facts sharing a start date) the quarters are walked in
+    order. A quarter with a reported 3-month fact is kept as is. A missing quarter k is
+    derived as cumulative(k) - cumulative(k-1) (Q2 = 6M YTD - 3M, Q3 = 9M YTD - 6M YTD,
+    Q4 = FY - 9M YTD), else as cumulative(k) minus the earlier discrete quarters
+    (Q4 = FY - Q1 - Q2 - Q3). Only use for additive metrics (USD flows), never per-share or
+    average share counts. Returns only the derived facts.
+    """
+    wanted = set(concepts)
+    periodic = [f for f in _periodic(facts, PERIODIC_FORMS) if f.concept in wanted and f.start]
+    direct: dict[tuple[str, str, date], Fact] = {}
+    groups: dict[tuple[str, str, date], dict[int, Fact]] = {}
+    for f in periodic:
+        assert f.start is not None
+        if _in(f.days, QUARTER_DAYS):
+            direct.setdefault((f.concept, f.unit, f.start), f)
+        k = _cumulative_index(f.days)
+        if k is not None:
+            cum = groups.setdefault((f.concept, f.unit, f.start), {})
+            if k not in cum or (f.filed, f.accession) > (cum[k].filed, cum[k].accession):
+                cum[k] = f
+
+    out: list[Fact] = []
+    for (concept, unit, fy_start), cum in sorted(groups.items(), key=lambda kv: kv[0][2]):
+        if len(cum) < 2:
+            continue
+        q_start = fy_start
+        quarters: list[Fact] = []
+        for k in range(1, 5):
+            q = direct.get((concept, unit, q_start))
+            if q is None:
+                total = cum.get(k)
+                if k == 1 or total is None:
+                    break
+                prev = cum.get(k - 1)
+                if prev is not None and prev.end + timedelta(days=1) == q_start:
+                    terms = [(_CUM_NAME[k], total), (_CUM_NAME[k - 1], prev)]
+                elif len(quarters) == k - 1:
+                    terms = [(_CUM_NAME[k], total)] + [
+                        (f"Q{i}", q) for i, q in enumerate(quarters, 1)
+                    ]
+                else:
+                    break
+                if not _in((total.end - q_start).days, QUARTER_DAYS):
+                    break
+                q = _derived_fact(total, q_start, total.end, terms)
+                direct[(concept, unit, q_start)] = q
+                out.append(q)
+            quarters.append(q)
+            q_start = q.end + timedelta(days=1)
+    return out
+
+
+def _additive_tags() -> set[str]:
+    return {t for s in METRICS.values() if s.kind == "duration" and s.unit == "USD" for t in s.tags}
+
+
 def duration_facts(facts: Iterable[Fact], periods: Periods) -> list[Fact]:
-    """Flow facts for the requested periodicity. Derived quarters will plug in here."""
+    """Flow facts for the requested periodicity; quarterly adds derived quarters."""
     facts = list(facts)
-    return select_annual(facts) if periods == "annual" else select_quarterly(facts)
+    if periods == "annual":
+        return select_annual(facts)
+    return select_quarterly(facts) + derive_quarters(facts, _additive_tags())
 
 
 def select_instant(facts: Iterable[Fact], ends: Iterable[date]) -> list[Fact]:
@@ -303,6 +414,7 @@ class FundamentalValue(BaseModel):
     accession: str | None = None
     filed: date | None = None
     derived: bool = False
+    note: str | None = None
     source_url: str | None = None
     reason: str | None = None
 
@@ -341,6 +453,7 @@ def _value(metric: str, spec: MetricSpec, cik: str, f: Fact, tag: str, **kw: Any
         accession=f.accession,
         filed=f.filed,
         derived=f.derived,
+        note=f.note,
         source_url=filing_index_url(cik, f.accession),
         **kw,
     )
@@ -371,6 +484,7 @@ def normalize(
         if f.concept in anchors:
             starts.setdefault(f.end, f.start)
     ends = sorted(starts, reverse=True)[:n]
+    reported_ends = {f.end for f in flows if f.concept in anchors and not f.derived}
     fy_ends = sorted({f.end for f in select_annual(facts) if f.concept in anchors})
 
     by_key: dict[tuple[str, str, date], Fact] = {}
@@ -412,7 +526,8 @@ def normalize(
             else:
                 found = _cover(metric, spec, cik, covers, end, label)
             if found is None:
-                null.reason = NO_VALUE
+                additive = spec.kind != "duration" or spec.unit == "USD"
+                null.reason = NO_VALUE if additive or end in reported_ends else NOT_ADDITIVE
                 found = null
             out.append(found)
     return out
@@ -495,8 +610,10 @@ async def get_fundamentals(
     notes = list(NOTES)
     if periods == "quarterly":
         notes.append(
-            "Quarterly values are only facts reported for a 3-month period; fiscal Q4 and "
-            "quarterly cash flow (reported year-to-date) are not derived yet."
+            "Quarterly values are 3-month facts where reported. Missing quarters of USD flow "
+            "metrics are derived (derived=true, formula in note): Q4 = FY - 9M YTD (or FY - "
+            "Q1 - Q2 - Q3); year-to-date cash flow gives Q2 = 6M - 3M and Q3 = 9M - 6M. EPS "
+            "and share counts are never derived."
         )
     return Fundamentals(
         source=SOURCE,

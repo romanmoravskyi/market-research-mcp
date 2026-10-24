@@ -200,17 +200,25 @@ async def test_source_fields(sec):
     xbrl.Fundamentals.model_validate(res.model_dump(mode="json"))
 
 
-async def test_quarterly_only_true_quarters(sec):
-    res = await xbrl.get_fundamentals("MSFT", metrics=["revenue"], periods="quarterly", n=3)
-    got = [(v.period_end, v.value, v.fiscal_year, v.fiscal_period) for v in res.values]
-    # Q4 (Apr-Jun) is never reported as a 3-month fact, so it is absent until T9 derives it.
+async def test_quarterly_reported_quarters_plus_derived_q4(sec):
+    res = await xbrl.get_fundamentals("MSFT", metrics=["revenue"], periods="quarterly", n=4)
+    got = [(v.period_end, v.value, v.fiscal_year, v.fiscal_period, v.derived) for v in res.values]
+    # Q4 (Apr-Jun) is never reported as a 3-month fact: FY 10-K 0001193125-26-323660
+    # ($331,839M) minus 9M YTD 10-Q 0001193125-26-191507 ($241,832M) = $90,007M.
     assert got == [
-        (date(2026, 3, 31), 82_886_000_000, 2026, "Q3"),
-        (date(2025, 12, 31), 81_273_000_000, 2026, "Q2"),
-        (date(2025, 9, 30), 77_673_000_000, 2026, "Q1"),
+        (date(2026, 6, 30), 90_007_000_000, 2026, "Q4", True),
+        (date(2026, 3, 31), 82_886_000_000, 2026, "Q3", False),
+        (date(2025, 12, 31), 81_273_000_000, 2026, "Q2", False),
+        (date(2025, 9, 30), 77_673_000_000, 2026, "Q1", False),
     ]
     for v in res.values:
         assert 80 <= (v.period_end - v.period_start).days <= 100
+    q4 = res.values[0]
+    assert q4.period_start == date(2026, 4, 1)
+    assert "FY - 9M YTD" in q4.note and "0001193125-26-191507" in q4.note
+    assert q4.accession == "0001193125-26-323660"
+    assert any("FY - 9M YTD" in n for n in res.notes)
+    assert not any("not derived yet" in n for n in res.notes)
 
 
 async def test_shares_outstanding_from_cover_page(sec):
@@ -254,3 +262,90 @@ async def test_cover_share_count_dated_on_period_end_stays_with_that_period(sec)
 def test_fiscal_label_extrapolates_outside_annual_periods(end, label):
     fy_ends = [date(2024, 6, 30), date(2025, 6, 30)]
     assert xbrl._fiscal_label(end, "quarterly", fy_ends) == label
+
+
+# ---------------------------------------------------------------- derived quarters (T9)
+
+
+def _cal_year(concept: str, values: dict[str, float], *, unit: str = "USD") -> list[Fact]:
+    """Calendar-2024 facts keyed by period label: Q1..Q4 (3 months), 6M, 9M, FY."""
+    periods = {
+        "Q1": ("2024-01-01", "2024-03-31", "10-Q", "2024-04-30", "0000000001-24-000001"),
+        "Q2": ("2024-04-01", "2024-06-30", "10-Q", "2024-07-30", "0000000001-24-000002"),
+        "6M": ("2024-01-01", "2024-06-30", "10-Q", "2024-07-30", "0000000001-24-000002"),
+        "Q3": ("2024-07-01", "2024-09-30", "10-Q", "2024-10-30", "0000000001-24-000003"),
+        "9M": ("2024-01-01", "2024-09-30", "10-Q", "2024-10-30", "0000000001-24-000003"),
+        "FY": ("2024-01-01", "2024-12-31", "10-K", "2025-02-15", "0000000001-25-000001"),
+    }
+    out = []
+    for label, value in values.items():
+        start, end, form, filed, accession = periods[label]
+        out.append(
+            fact(concept, start, end, value, form=form, filed=filed, accession=accession, unit=unit)
+        )
+    return out
+
+
+def _quarters(vals, metric):
+    return {v.fiscal_period: v for v in vals if v.metric == metric and v.fiscal_year == 2024}
+
+
+def test_q4_derived_as_fy_minus_9m_ytd():
+    facts = _cal_year("Revenues", {"Q1": 10, "Q2": 15, "6M": 25, "Q3": 20, "9M": 45, "FY": 70})
+    vals = xbrl.normalize(facts, cik="1", metrics=["revenue"], periods="quarterly", n=4)
+    q = _quarters(vals, "revenue")
+    assert [q[p].value for p in ("Q1", "Q2", "Q3", "Q4")] == [10, 15, 20, 25]
+    assert not q["Q1"].derived and not q["Q3"].derived
+    q4 = q["Q4"]
+    assert q4.derived is True
+    assert q4.period_start == date(2024, 10, 1) and q4.period_end == date(2024, 12, 31)
+    assert q4.note and "FY - 9M YTD" in q4.note
+    assert "0000000001-25-000001" in q4.note and "0000000001-24-000003" in q4.note
+    # The derived value points at the latest filing used (the 10-K).
+    assert q4.accession == "0000000001-25-000001" and q4.form == "10-K"
+
+
+def test_q4_falls_back_to_fy_minus_three_quarters():
+    facts = _cal_year("Revenues", {"Q1": 10, "Q2": 15, "Q3": 20, "FY": 70})
+    vals = xbrl.normalize(facts, cik="1", metrics=["revenue"], periods="quarterly", n=4)
+    q4 = _quarters(vals, "revenue")["Q4"]
+    assert q4.value == 25 and q4.derived
+    assert "FY - Q1 - Q2 - Q3" in q4.note
+
+
+def test_cash_flow_quarters_derived_from_ytd():
+    facts = _cal_year(
+        "NetCashProvidedByUsedInOperatingActivities",
+        {"Q1": 30, "6M": 54, "9M": 82, "FY": 111},
+    )
+    vals = xbrl.normalize(facts, cik="1", metrics=["operating_cash_flow"], periods="quarterly", n=4)
+    q = _quarters(vals, "operating_cash_flow")
+    assert [q[p].value for p in ("Q1", "Q2", "Q3", "Q4")] == [30, 24, 28, 29]
+    assert [q[p].derived for p in ("Q1", "Q2", "Q3", "Q4")] == [False, True, True, True]
+    assert "6M YTD - 3M" in q["Q2"].note
+    assert "9M YTD - 6M YTD" in q["Q3"].note
+    assert q["Q2"].period_start == date(2024, 4, 1)
+
+
+def test_direct_quarter_wins_over_derivation():
+    facts = _cal_year("Revenues", {"Q1": 10, "Q2": 16, "6M": 25, "FY": 70})  # Q2 direct
+    vals = xbrl.normalize(facts, cik="1", metrics=["revenue"], periods="quarterly", n=4)
+    q2 = _quarters(vals, "revenue")["Q2"]
+    assert q2.value == 16 and not q2.derived
+
+
+def test_per_share_and_share_count_q4_not_derived():
+    facts = _cal_year("Revenues", {"Q1": 10, "Q2": 15, "Q3": 20, "9M": 45, "FY": 70})
+    facts += _cal_year(
+        "EarningsPerShareDiluted", {"Q1": 1.0, "Q2": 1.5, "Q3": 2.0, "FY": 7.0}, unit="USD/shares"
+    )
+    vals = xbrl.normalize(facts, cik="1", metrics=["diluted_eps"], periods="quarterly", n=4)
+    q4 = _quarters(vals, "diluted_eps")["Q4"]
+    assert q4.value is None
+    assert "not additive" in q4.reason
+
+
+def test_annual_values_unaffected_by_derivation():
+    facts = _cal_year("Revenues", {"Q1": 10, "6M": 25, "9M": 45, "FY": 70})
+    vals = xbrl.normalize(facts, cik="1", metrics=["revenue"], periods="annual", n=4)
+    assert [(v.value, v.derived) for v in vals] == [(70, False)]
