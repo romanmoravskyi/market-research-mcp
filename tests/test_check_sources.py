@@ -186,3 +186,33 @@ def test_review_every_unresolved_ref_reported():  # finding 8
     assert len(out) == 1, out
     assert "[9]" in out[0]
     assert "[1]" not in out[0]
+
+
+# End-to-end run (T13): false positives on lines the skill itself asks for.
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "## Insiders (Form 4 filings 2026-09-01 to 2026-10-15)",  # ISO dates in a heading
+        "Fiscal year ends June 30.",  # the skill asks to state a non-December year end
+        "Fiscal year ends September 30 (fiscal 2026 = October 2025 to September 2026).",
+        "Q4 flows marked derived are FY minus 9M YTD.",  # the tool's own period label
+        "Quarters use 6M YTD and 9M YTD facts.",
+    ],
+)
+def test_e2e_dates_and_period_labels_not_flagged(line):
+    assert reasons(doc(line + "\n")) == []
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "## Revenue $12.3B (2026-06-30)",  # a heading with a number still needs a source
+        "Revenue June 30 was $9M.",
+        "Cash of $9M YTD.",
+    ],
+)
+def test_e2e_money_next_to_dates_still_flagged(line):
+    out = reasons(doc(line + "\n"))
+    assert len(out) == 1, out

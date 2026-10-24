@@ -68,6 +68,14 @@ NON_FINANCIAL_PATTERNS = [
         re.IGNORECASE,
     ),
     re.compile(r"\((?:19|20)\d{2}\)"),  # "(2025)"
+    # Month and day without a year, e.g. a fiscal year end "June 30". Capitalized month
+    # names only, so the verb "may" before a number is not taken for a date.
+    re.compile(
+        r"\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|June?|July?|Aug(?:ust)?|"
+        r"Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+\d{1,2}\b"
+        r"(?![\d%]|[.,]\d|\s?[BMK]\b)"
+    ),
+    re.compile(r"(?<![$\d.,])\b(?:3|6|9)M\s+YTD\b"),  # year-to-date labels: 9M YTD
     re.compile(r"\b10b5-1\b", re.IGNORECASE),  # SEC Rule 10b5-1
 ]
 
@@ -191,7 +199,8 @@ def check_text(text: str) -> list[Problem]:
         check_line = raw
         if sec == "heading":
             # Years in headings are fine; other numbers in headings still need a source.
-            check_line = re.sub(r"\b(?:19|20)\d{2}\b", " ", raw)
+            # Leave ISO dates intact for NON_FINANCIAL_PATTERNS ("2026-09-01" is a date).
+            check_line = re.sub(r"(?<![\d-])\b(?:19|20)\d{2}\b(?!-\d)", " ", raw)
         if not has_financial_number(check_line):
             continue
         if URL_RE.search(raw):
