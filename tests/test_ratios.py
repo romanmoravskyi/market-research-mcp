@@ -19,9 +19,11 @@ import respx
 from market_research_mcp import cache as cache_mod
 from market_research_mcp import http
 from market_research_mcp.cache import Cache
+from market_research_mcp.config import ConfigError
 from market_research_mcp.errors import BadInput
 from market_research_mcp.ratelimit import reset_limiters
 from market_research_mcp.sources import edgar, ratios, xbrl
+from market_research_mcp.sources.prices import Split
 from market_research_mcp.sources.xbrl import Fact
 
 SEC = Path(__file__).parent / "fixtures" / "sec"
@@ -51,6 +53,19 @@ async def _isolated(tmp_path, monkeypatch):
     await http.aclose()
     cache_mod.set_default_cache(None)
     reset_limiters()
+
+
+@pytest.fixture(autouse=True)
+def no_splits_since_filing(monkeypatch):
+    """Price-provider split lookups need a key; tests stub them (default: no splits)."""
+    calls = []
+
+    async def lookup(ticker, start, end):
+        calls.append((ticker, start, end))
+        return []
+
+    monkeypatch.setattr(ratios, "split_lookup", lookup)
+    return calls
 
 
 @pytest.fixture
@@ -139,7 +154,7 @@ async def test_bank_ratios_that_do_not_apply_are_null(sec):
 
 
 async def test_reit_ratios_that_do_not_apply_are_null(sec):
-    res = await ratios.get_key_ratios("O", n=1, price=60.0)
+    res = await ratios.get_key_ratios("O", n=1, price=60.0, price_date=date(2026, 10, 23))
     assert res.industry == "reit"
     got = by_key(res)
     for name in ("gross_margin", "current_ratio", "fcf_margin", "pe"):
@@ -220,3 +235,55 @@ def test_negative_equity_and_revenue_guarded():
     got = {r.ratio: r for r in out}
     assert got["net_margin"].value is None and "revenue" in got["net_margin"].reason
     assert got["roe"].value is None and "equity" in got["roe"].reason
+
+
+# ---------------------------------------------------------------- review fixes (PR #7)
+
+
+async def test_price_requires_price_date(sec):
+    with pytest.raises(BadInput):
+        await ratios.get_key_ratios("AAPL", price=250.0)
+
+
+async def test_pe_adjusts_eps_for_split_after_last_filing(sec, monkeypatch):
+    # AAPL FY2025 EPS $7.46 was filed 2025-10-31; a (hypothetical) 4:1 split afterwards puts
+    # the price on a basis 4x smaller than the EPS.
+    async def lookup(ticker, start, end):
+        return [Split(date=date(2026, 9, 1), factor=4.0)]
+
+    monkeypatch.setattr(ratios, "split_lookup", lookup)
+    res = await ratios.get_key_ratios("AAPL", n=1, price=62.5, price_date=date(2026, 10, 23))
+    pe = by_key(res)[(2025, "pe")]
+    assert pe.value == round(62.5 / (7.46 / 4), 4)
+    assert "4:1" in pe.note and "2026-09-01" in pe.note
+    assert pe.inputs["diluted_eps"] == round(7.46 / 4, 6)
+
+
+async def test_pe_null_when_split_check_unavailable(sec, monkeypatch):
+    async def lookup(ticker, start, end):
+        raise ConfigError("TIINGO_API_KEY is not set")
+
+    monkeypatch.setattr(ratios, "split_lookup", lookup)
+    res = await ratios.get_key_ratios("AAPL", n=1, price=250.0, price_date=date(2026, 10, 23))
+    pe = by_key(res)[(2025, "pe")]
+    assert pe.value is None and "split" in pe.reason
+
+
+async def test_pe_no_split_check_when_price_not_after_filing(sec, no_splits_since_filing):
+    await ratios.get_key_ratios("AAPL", n=1, price=250.0, price_date=date(2025, 10, 31))
+    assert no_splits_since_filing == []
+
+
+async def test_pe_split_already_in_sec_data_not_applied_twice(sec, monkeypatch):
+    # NVDA's June 2024 10:1 split is already reflected in its FY2026 EPS ($4.90).
+    async def lookup(ticker, start, end):
+        return [Split(date=date(2024, 6, 10), factor=10.0)]
+
+    monkeypatch.setattr(ratios, "split_lookup", lookup)
+    res = await ratios.get_key_ratios("NVDA", n=1, price=180.0, price_date=date(2026, 10, 23))
+    assert by_key(res)[(2026, "pe")].value == round(180.0 / 4.9, 4)
+
+
+def test_insurance_agents_are_not_insurers():
+    assert ratios.classify_industry("6411", [])[0] == "general"
+    assert ratios.classify_industry("6331", [])[0] == "insurer"

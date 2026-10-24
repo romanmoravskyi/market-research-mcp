@@ -461,3 +461,71 @@ def test_unit_scale_errors_are_not_splits():
 async def test_aapl_splits_detected_without_scale_noise(sec):
     res = await xbrl.get_fundamentals("AAPL", metrics=["shares_diluted"], n=1)
     assert [s.ratio for s in res.splits] == [7, 4]  # 7:1 June 2014, 4:1 August 2020
+
+
+# ---------------------------------------------------------------- review fixes (PR #7)
+
+
+@pytest.mark.parametrize(
+    ("ratio", "label"), [(10, "10:1"), (1.5, "3:2"), (0.1, "1:10"), (0.2, "1:5"), (2 / 3, "2:3")]
+)
+def test_split_ratio_label_handles_reverse_splits(ratio, label):
+    assert xbrl._ratio_label(ratio) == label
+
+
+def test_phantom_combined_split_dropped():
+    # Two real 2:1 splits (2022, 2023). One series was reported only before the first and
+    # after the second, so its consecutive filings differ by 4: that is not a third split.
+    w = "WeightedAverageNumberOfDilutedSharesOutstanding"
+    sh = "shares"
+    facts = []
+    for y, (a, b, c) in {2019: (100, 200, 400), 2020: (110, 220, 440)}.items():
+        facts += [
+            fact(w, f"{y}-01-01", f"{y}-12-31", a, filed="2022-02-01", unit=sh),
+            fact(w, f"{y}-01-01", f"{y}-12-31", b, filed="2022-08-01", unit=sh),
+            fact(w, f"{y}-01-01", f"{y}-12-31", c, filed="2023-08-01", unit=sh),
+        ]
+    for q in ("01", "04"):
+        facts += [
+            fact(w, f"2018-{q}-01", f"2018-{q}-28", 50, filed="2021-11-01", unit=sh),
+            fact(w, f"2018-{q}-01", f"2018-{q}-28", 200, filed="2024-02-01", unit=sh),
+        ]
+    assert [s.ratio for s in xbrl.detect_splits(facts)] == [2, 2]
+
+
+def test_reported_quarter_under_later_tag_beats_derived():
+    facts = _cal_year("Revenues", {"Q1": 10, "6M": 25, "FY": 70})
+    facts += [
+        fact(
+            "RevenueFromContractWithCustomerExcludingAssessedTax",
+            "2024-04-01",
+            "2024-06-30",
+            14,
+            form="10-Q",
+            filed="2024-07-30",
+        )
+    ]
+    vals = xbrl.normalize(facts, cik="1", metrics=["revenue"], periods="quarterly", n=4)
+    q2 = _quarters(vals, "revenue")["Q2"]
+    assert q2.value == 14 and not q2.derived
+    assert q2.tag == "RevenueFromContractWithCustomerExcludingAssessedTax"
+
+
+def test_implausible_derived_revenue_is_null_with_reason():
+    # FY recast lower in the 10-K (e.g. discontinued operations) than the 10-Q 9M YTD.
+    facts = _cal_year("Revenues", {"Q1": 10, "Q2": 15, "Q3": 20, "9M": 45, "FY": 30})
+    vals = xbrl.normalize(facts, cik="1", metrics=["revenue"], periods="quarterly", n=4)
+    q4 = _quarters(vals, "revenue")["Q4"]
+    assert q4.value is None and q4.derived
+    assert "implausible" in q4.reason and "FY - 9M YTD" in q4.reason
+
+
+def test_negative_derived_net_income_is_kept():
+    facts = _cal_year("NetIncomeLoss", {"Q1": 10, "Q2": 15, "Q3": 20, "9M": 45, "FY": 30})
+    vals = xbrl.normalize(facts, cik="1", metrics=["net_income"], periods="quarterly", n=4)
+    assert _quarters(vals, "net_income")["Q4"].value == -15
+
+
+async def test_quarterly_notes_do_not_claim_ytd_excluded(sec):
+    res = await xbrl.get_fundamentals("MSFT", metrics=["revenue"], periods="quarterly", n=1)
+    assert not any("year-to-date 10-Q facts are excluded" in n for n in res.notes)

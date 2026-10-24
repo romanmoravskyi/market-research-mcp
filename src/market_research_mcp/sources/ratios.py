@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from typing import Literal
 
 from mcp.server.fastmcp import FastMCP
@@ -19,7 +19,7 @@ from pydantic import BaseModel
 
 from market_research_mcp.errors import BadInput, ToolError
 from market_research_mcp.models import Sourced
-from market_research_mcp.sources import edgar, xbrl
+from market_research_mcp.sources import edgar, prices, xbrl
 
 __all__ = [
     "RATIOS",
@@ -132,10 +132,10 @@ NOT_APPLICABLE: dict[str, dict[str, str]] = {
     },
 }
 
-# SEC SIC codes: 6020-6036 commercial banks and savings institutions; 6311-6411 insurance
-# carriers and agents; 6798 real estate investment trusts.
+# SEC SIC codes: 6020-6036 commercial banks and savings institutions; 6311-6399 insurance
+# carriers; 6798 real estate investment trusts.
 BANK_SIC = range(6020, 6037)
-INSURER_SIC = range(6311, 6412)
+INSURER_SIC = range(6311, 6400)  # 6411 agents/brokers excluded
 REIT_SIC = 6798
 
 NOTES = [
@@ -144,6 +144,8 @@ NOTES = [
     "A ratio is null with a reason when an input is missing, a denominator is zero or "
     "negative, or the ratio does not apply to the industry (banks, insurers, REITs).",
     "Quarterly ROE and ROA use one quarter's net income and are not annualized.",
+    "P/E puts EPS on the price's share basis: splits between the EPS filing and price_date "
+    "come from the configured price provider; if that check fails, P/E is null.",
     "Descriptive figures only; not investment advice and not a buy/sell signal.",
 ]
 
@@ -247,8 +249,17 @@ def compute(
     price: float | None = None,
     price_date: date | None = None,
     splits: list[xbrl.SplitEvent] | None = None,
+    price_splits: list[prices.Split] | None = None,
+    price_split_error: str | None = None,
 ) -> list[RatioValue]:
-    """Ratios for the newest `n` periods (newest first), one row per (period, ratio)."""
+    """Ratios for the newest `n` periods (newest first), one row per (period, ratio).
+
+    `price_splits` are splits from a price provider; those after the EPS filing and on or
+    before `price_date` (and not already in the SEC data) put EPS on the price's basis.
+    `price_split_error` (the lookup failed) makes P/E null.
+    """
+    if splits is None:
+        splits = xbrl.detect_splits(facts)
     values = xbrl.normalize(
         facts, cik=cik, metrics=_metrics_needed(), periods=periods, n=n, splits=splits
     )
@@ -277,7 +288,8 @@ def compute(
             if periods == "quarterly" and name in ("roe", "roa"):
                 formula += "; quarterly net income, not annualized"
             out.append(_ratio(name, spec, formula, row, na.get(name), base))
-        out.append(_pe(row, na.get(PE), base, periods, i == 0, price, price_date))
+        pe_ctx = _PriceContext(price, price_date, splits, price_splits or [], price_split_error)
+        out.append(_pe(row, na.get(PE), base, periods, i == 0, pe_ctx))
     return out
 
 
@@ -314,16 +326,36 @@ def _ratio(
     return r
 
 
+@dataclass(frozen=True)
+class _PriceContext:
+    price: float | None
+    price_date: date | None
+    sec_splits: list[xbrl.SplitEvent]
+    provider_splits: list[prices.Split]
+    provider_error: str | None
+
+
+def _splits_after_filing(eps_filed: date, ctx: _PriceContext) -> list[prices.Split]:
+    """Provider splits between the EPS filing and the price date not already in SEC data."""
+    assert ctx.price_date is not None
+    return [
+        s
+        for s in ctx.provider_splits
+        if eps_filed < s.date <= ctx.price_date
+        and s.factor not in (0, 1)
+        and not any(e.after < s.date <= e.before for e in ctx.sec_splits)
+    ]
+
+
 def _pe(
     row: dict[str, xbrl.FundamentalValue],
     not_applicable: str | None,
     base: dict,
     periods: xbrl.Periods,
     latest: bool,
-    price: float | None,
-    price_date: date | None,
+    ctx: _PriceContext,
 ) -> RatioValue:
-    when = price_date.isoformat() if price_date else "an unspecified date"
+    price, price_date = ctx.price, ctx.price_date
     r = RatioValue(ratio=PE, value=None, formula=PE_FORMULA, source=SOURCE, **base)
     if not_applicable:
         r.reason = not_applicable
@@ -334,14 +366,16 @@ def _pe(
     if not latest:
         r.reason = "the price applies to the latest fiscal year only"
         return r
-    if price is None:
+    if price is None or price_date is None:
         r.reason = (
-            "no price passed: pass price= (and price_date=) to compute P/E; no keyless price "
+            "no price passed: pass price= and price_date= to compute P/E; no keyless price "
             "source is available"
         )
         return r
     eps = row.get("diluted_eps")
-    r.source = f"{SOURCE} (diluted EPS); caller-supplied price {price:g} as of {when}"
+    r.source = (
+        f"{SOURCE} (diluted EPS); caller-supplied price {price:g} as of {price_date.isoformat()}"
+    )
     if eps is not None:
         r.inputs = {"price": price, "diluted_eps": eps.value}
         for k, val in _sourced([eps]).items():
@@ -353,21 +387,62 @@ def _pe(
     if eps.value <= 0:
         r.reason = "diluted EPS is zero or negative; P/E not meaningful"
         return r
-    r.value = _round(price / eps.value)
+    eps_value = eps.value
+    if eps.filed is not None and price_date > eps.filed:
+        if ctx.provider_error:
+            r.reason = (
+                f"cannot confirm the price and EPS share basis match: split check since the "
+                f"EPS filing ({eps.filed}) failed ({ctx.provider_error})"
+            )
+            return r
+        later = _splits_after_filing(eps.filed, ctx)
+        factor = 1.0
+        for s in later:
+            factor *= s.factor
+        if later:
+            eps_value = round(eps_value / factor, 6)
+            r.inputs["diluted_eps"] = eps_value
+            done = ", ".join(f"{xbrl._ratio_label(s.factor)} on {s.date}" for s in later)
+            note = (
+                f"EPS divided by {factor:g} for split(s) after its filing ({done}; from the "
+                "price provider) to match the price's share basis"
+            )
+            r.note = f"{r.note}; {note}" if r.note else note
+    r.value = _round(price / eps_value)
     return r
 
 
 # ---------------------------------------------------------------- tool
 
 
-async def _sic(cik: str) -> str | None:
+async def _sic(cik: str) -> tuple[str | None, bool]:
+    """(SIC code, stale) from SEC submissions; (None, False) when unavailable."""
     try:
         sub = await edgar.get_submissions(cik)
     except ToolError as exc:
         logger.warning("SIC lookup failed for CIK %s: %s", cik, type(exc).__name__)
-        return None
+        return None, False
     sic = sub.data.get("sic")
-    return str(sic) if sic not in (None, "") else None
+    return (str(sic) if sic not in (None, "") else None), sub.stale
+
+
+# Split history from the configured price provider (needs its key); patched in tests.
+split_lookup = prices.get_split_history
+
+
+async def _price_splits(
+    ticker: str, facts: list[xbrl.Fact], cik: str, splits: list[xbrl.SplitEvent], price_date: date
+) -> tuple[list[prices.Split], str | None]:
+    """Provider splits after the latest annual EPS filing, or the reason the lookup failed."""
+    eps = xbrl.normalize(facts, cik=cik, metrics=["diluted_eps"], n=1, splits=splits)
+    filed = eps[0].filed if eps else None
+    if filed is None or price_date <= filed:
+        return [], None
+    try:
+        return await split_lookup(ticker, filed + timedelta(days=1), price_date), None
+    except Exception as exc:  # any provider failure (missing key, HTTP, import) -> null P/E
+        logger.warning("split lookup failed for %s: %s", ticker, type(exc).__name__)
+        return [], f"price provider unavailable: {type(exc).__name__}"
 
 
 async def get_key_ratios(
@@ -382,8 +457,9 @@ async def get_key_ratios(
     Ratios: gross_margin, operating_margin, net_margin, roe, roa, debt_to_equity,
     current_ratio, fcf_margin ((operating cash flow - capex) / revenue) and pe. periods:
     "annual" or "quarterly" (quarterly uses derived Q4 / year-to-date quarters where
-    needed). n: number of periods (1-20). P/E needs a share price: pass price (and
-    price_date); it uses the latest fiscal year's diluted EPS. Each ratio carries its
+    needed). n: number of periods (1-20). P/E needs a share price: pass price and
+    price_date (both required together); it uses the latest fiscal year's diluted EPS, put
+    on the price's share basis using splits since the EPS filing. Each ratio carries its
     formula, inputs, source filing URL and filing date. Ratios that do not apply to banks,
     insurers or REITs, or whose inputs are missing, are null with a reason. Descriptive
     figures only. Source: SEC EDGAR XBRL companyfacts.
@@ -394,10 +470,19 @@ async def get_key_ratios(
         raise BadInput(f"n must be between 1 and {MAX_N}")
     if price is not None and not price > 0:
         raise BadInput("price must be a positive number")
+    if price is not None and price_date is None:
+        raise BadInput("price_date is required with price (every number carries its date)")
 
     company, url, res, facts = await xbrl.load_company_facts(ticker)
-    industry, basis = classify_industry(await _sic(company.cik), facts)
+    sic, sub_stale = await _sic(company.cik)
+    industry, basis = classify_industry(sic, facts)
     splits = xbrl.detect_splits(facts)
+    price_splits: list[prices.Split] = []
+    price_split_error = None
+    if price is not None and price_date is not None and industry != "reit":
+        price_splits, price_split_error = await _price_splits(
+            company.ticker, facts, company.cik, splits, price_date
+        )
     rows = compute(
         facts,
         cik=company.cik,
@@ -407,6 +492,8 @@ async def get_key_ratios(
         price=price,
         price_date=price_date,
         splits=splits,
+        price_splits=price_splits,
+        price_split_error=price_split_error,
     )
     dates = [r.as_of for r in rows if r.as_of is not None]
     return KeyRatios(
@@ -414,7 +501,7 @@ async def get_key_ratios(
         source_url=url,
         retrieved_at=res.fetched_at,
         as_of=max(dates, default=None),
-        stale=res.stale,
+        stale=res.stale or sub_stale,
         notes=list(NOTES),
         ticker=company.ticker,
         cik=company.cik,

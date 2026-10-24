@@ -17,7 +17,7 @@ the filings used.
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, timedelta
 from fractions import Fraction
 from typing import Any, Literal
@@ -167,8 +167,9 @@ METRICS: dict[str, MetricSpec] = {
 }
 
 NOTES = [
-    "Periods are selected by duration: annual 350-380 days, quarterly 80-100 days; "
-    "year-to-date 10-Q facts are excluded.",
+    "Periods are selected by duration: annual 350-380 days, quarterly 80-100 days. "
+    "Year-to-date 10-Q facts are never shown as quarters; they only feed derived quarters "
+    "(quarterly periods, derived=true).",
     "fiscal_year is the calendar year in which the period (or its fiscal year) ends; a "
     "52/53-week year ending in the first 7 days of January counts as the prior year. A "
     "company's own label can differ.",
@@ -181,7 +182,8 @@ NOTES = [
     "split-adjusted: the company's own restated figures are preferred; values filed only "
     "before a split are multiplied (shares) or divided (per share) by the split ratio "
     "(split_factor, with a note). Splits are detected from SEC facts restated by a clean "
-    "ratio between consecutive filings.",
+    "ratio between consecutive filings. Mechanically adjusted EPS keeps more decimals than "
+    "company-restated EPS, which is rounded to cents.",
 ]
 
 
@@ -196,7 +198,7 @@ class Fact:
     unit: str
     start: date | None
     end: date
-    value: int | float
+    value: int | float | None  # None only for a rejected derived quarter (see note)
     accession: str
     form: str
     filed: date
@@ -287,11 +289,28 @@ def _cumulative_index(days: int | None) -> int | None:
 
 
 _CUM_NAME = {1: "3M", 2: "6M YTD", 3: "9M YTD", 4: "FY"}
+DERIVED_BAND = (0.2, 5.0)  # a derived revenue quarter vs the mean of the year's other quarters
+
+
+def _implausible(concept: str, value: float, others: list[Fact]) -> str | None:
+    """Why a derived quarter cannot be right, for metrics that are never negative."""
+    if concept in _non_negative_tags() and value < 0:
+        return "negative"
+    if concept in _revenue_tags():
+        if value <= 0:
+            return "zero or negative revenue"
+        known = [f.value for f in others if f.value is not None and f.value > 0]
+        if known:
+            mean = sum(known) / len(known)
+            lo, hi = DERIVED_BAND
+            if not lo * mean <= value <= hi * mean:
+                return f"outside {lo:g}x-{hi:g}x of the year's other quarters"
+    return None
 
 
 def _derived_fact(template: Fact, start: date, end: date, terms: list[tuple[str, Fact]]) -> Fact:
     """A derived quarter: first term minus the others. Sourced to the latest filing used."""
-    value = terms[0][1].value - sum(f.value for _, f in terms[1:])
+    value = terms[0][1].value - sum(f.value for _, f in terms[1:])  # type: ignore[operator]
     if isinstance(value, float):
         value = round(value, 6)
     latest = max((f for _, f in terms), key=lambda f: (f.filed, f.accession))
@@ -362,11 +381,26 @@ def derive_quarters(facts: Iterable[Fact], concepts: Iterable[str]) -> list[Fact
                 if not _in((total.end - q_start).days, QUARTER_DAYS):
                     break
                 q = _derived_fact(total, q_start, total.end, terms)
+                assert q.value is not None
+                why = _implausible(concept, q.value, quarters)
+                if why:
+                    # Usually a recast between filings (e.g. discontinued operations).
+                    note = f"implausible derived value {q.value:g} ({why}); {q.note}"
+                    out.append(replace(q, value=None, note=note))
+                    break
                 direct[(concept, unit, q_start)] = q
                 out.append(q)
             quarters.append(q)
             q_start = q.end + timedelta(days=1)
     return out
+
+
+def _revenue_tags() -> set[str]:
+    return set(METRICS["revenue"].tags) | set(METRICS["gross_profit"].tags)
+
+
+def _non_negative_tags() -> set[str]:
+    return _revenue_tags() | set(METRICS["capex"].tags)
 
 
 def _additive_tags() -> set[str]:
@@ -491,12 +525,27 @@ def detect_splits(facts: Iterable[Fact]) -> list[SplitEvent]:
         for r, a, b, e in clusters
         if e >= SPLIT_MIN_EVIDENCE
     ]
-    return sorted(events, key=lambda s: s.before)
+    return sorted((e for e in events if not _composite(e, events)), key=lambda s: s.before)
+
+
+def _composite(event: SplitEvent, events: list[SplitEvent]) -> bool:
+    """True when `event` is two or more other splits seen across one wide filing gap."""
+    inner = [
+        o for o in events if o is not event and event.after <= o.after and o.before <= event.before
+    ]
+    if len(inner) < 2:
+        return False
+    product = 1.0
+    for o in inner:
+        product *= o.ratio
+    return abs(product - event.ratio) / event.ratio <= SPLIT_TOLERANCE
 
 
 def _ratio_label(ratio: float) -> str:
-    frac = Fraction(ratio).limit_denominator(4)
-    return f"{frac.numerator}:{frac.denominator}"
+    """'10:1' for a forward split, '1:10' for a reverse split (ratio 0.1)."""
+    frac = Fraction(max(ratio, 1 / ratio)).limit_denominator(4)
+    a, b = frac.numerator, frac.denominator
+    return f"{a}:{b}" if ratio >= 1 else f"{b}:{a}"
 
 
 def _split_adjust(v: FundamentalValue, splits: list[SplitEvent]) -> FundamentalValue:
@@ -604,7 +653,9 @@ def normalize(
 
     Fallback tags are tried per period: the first tag with a value for that period wins.
     Metrics with no matching tag at all, or no value for a period, return value None with a
-    reason. Nothing is estimated or filled in.
+    reason. Nothing is estimated; quarterly flows missing as 3-month facts are derived by
+    subtraction (see `derive_quarters`) and marked derived. A reported 3-month fact under any
+    fallback tag wins over a derived one.
     """
     names = metrics or list(METRICS)
     if splits is None:
@@ -650,12 +701,17 @@ def normalize(
                 continue
             found: FundamentalValue | None = None
             if spec.kind == "duration":
-                for tag in spec.tags:
-                    f = by_key.get((tag, spec.unit, end))
-                    if f is not None:
-                        kw = {"period_start": f.start, "period_end": end, **label}
-                        found = _value(metric, spec, cik, f, tag, **kw)
-                        break
+                candidates = [
+                    (f.derived, i, tag, f)
+                    for i, tag in enumerate(spec.tags)
+                    if (f := by_key.get((tag, spec.unit, end))) is not None
+                ]
+                if candidates:
+                    _, _, tag, f = min(candidates, key=lambda c: (c[0], c[1]))
+                    kw = {"period_start": f.start, "period_end": end, **label}
+                    found = _value(metric, spec, cik, f, tag, **kw)
+                    if f.value is None:
+                        found.reason = f.note
             elif spec.kind == "instant":
                 found = _instant(metric, spec, cik, instants, end, label)
             else:

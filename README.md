@@ -9,6 +9,20 @@ market data: SEC EDGAR filings, FRED macro series and end-of-day prices.
   moves money.
 - **Bring your own keys.** Keys are read from environment variables or a local `.env` file.
 
+## Tools
+
+- `ping`: server status and version.
+- `resolve_ticker`, `list_filings`, `get_filing_section`, `get_filing_exhibit`: SEC EDGAR
+  companies, filings and filing text.
+- `get_insider_transactions`: SEC Form 4 insider transactions.
+- `get_fundamentals`: XBRL fundamentals (annual or quarterly; derived Q4 and split-adjusted
+  share data are marked).
+- `get_key_ratios`: margins, ROE, ROA, debt/equity, current ratio, FCF margin and P/E (with a
+  caller-supplied price and date), each with formula and source filing; null with a reason
+  where a ratio does not apply (banks, insurers, REITs).
+- `get_price_history`, `get_price_stats`: end-of-day prices (needs a price provider key).
+- `get_earnings_calendar`, `get_macro_series`: earnings dates and FRED macro series.
+
 ## Setup
 
 Requires [uv](https://docs.astral.sh/uv/) (it installs Python 3.12+ for you).
