@@ -40,7 +40,7 @@ Read-only research. The user makes every investment decision.
 7. Insiders, last 12 months: `get_insider_transactions(ticker, since=<12 months ago>)`.
    Headline: only codes P (open-market purchase) and S (open-market sale): counts, shares,
    value. All other codes (A, M, F, G, ...) go in a footnote as counts, labelled "not
-   open-market trades". If `filings_capped` is true, the totals cover only filings from
+   open-market trades". If `filings_capped` is true, the totals are complete only from
    `covered_since`: state that window instead of "12 months".
 8. `get_earnings_calendar([ticker], days_ahead=120)` -> next earnings date, or "none found".
 9. Choose the output folder. Get `JOURNAL_DIR` from the same settings the server uses
