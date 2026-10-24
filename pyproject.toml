@@ -8,6 +8,7 @@ license-files = ["LICENSE"]
 authors = [{ name = "market-research-mcp contributors" }]
 requires-python = ">=3.12"
 dependencies = [
+    "edgartools>=5.62.1",
     "httpx>=0.28.1",
     "mcp>=1.30,<2",
     "pydantic>=2,<3",
@@ -17,6 +18,11 @@ dependencies = [
 
 [project.scripts]
 market-research-mcp = "market_research_mcp.server:main"
+
+[project.optional-dependencies]
+yfinance = [
+    "yfinance>=1.7.0",
+]
 
 [build-system]
 requires = ["uv_build>=0.12.21,<0.13.0"]
