@@ -12,6 +12,7 @@ dependencies = [
     "mcp>=1.30,<2",
     "pydantic>=2,<3",
     "python-dotenv>=1.2.4",
+    "tzdata>=2026.5",
 ]
 
 [project.scripts]
