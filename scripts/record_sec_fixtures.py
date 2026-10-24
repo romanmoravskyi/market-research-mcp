@@ -5,7 +5,8 @@ Usage (from the repo root):
     uv run python scripts/record_sec_fixtures.py
 
 Downloads company_tickers_exchange.json, submissions JSON for MSFT, JPM, O and BRK-B, and
-company facts (gzip-compressed) for MSFT, AAPL, JPM, BRK-B, O and NVDA. Requests are limited
+company facts for MSFT, AAPL, JPM, BRK-B, O and NVDA. Every file is written gzip-compressed
+(`*.json.gz`) to keep the repo small. Requests are limited
 to 10 per second as SEC asks. The User-Agent is read from the environment only and is never
 written to disk or printed.
 """
@@ -61,9 +62,11 @@ class Client:
         self._client.close()
 
 
-def write_json(path: Path, raw: bytes) -> None:
+def write_json_gz(path: Path, raw: bytes) -> None:
+    """Validate JSON and write it gzip-compressed (deterministic: mtime=0) to `<path>.gz`."""
     data = json.loads(raw)
-    path.write_text(json.dumps(data, indent=1) + "\n", encoding="utf-8")
+    text = json.dumps(data, indent=1) + "\n"
+    path.with_name(path.name + ".gz").write_bytes(gzip.compress(text.encode("utf-8"), mtime=0))
 
 
 def main() -> int:
@@ -80,15 +83,15 @@ def main() -> int:
     (OUT / "companyfacts").mkdir(exist_ok=True)
     client = Client(user_agent)
     try:
-        write_json(OUT / "company_tickers_exchange.json", client.get(TICKERS_URL))
+        write_json_gz(OUT / "company_tickers_exchange.json", client.get(TICKERS_URL))
 
         for cik in SUBMISSIONS.values():
             name = f"CIK{cik:010d}.json"
             raw = client.get(f"https://data.sec.gov/submissions/{name}")
-            write_json(OUT / name, raw)
+            write_json_gz(OUT / name, raw)
             for page in json.loads(raw).get("filings", {}).get("files", [])[:MAX_OLDER_PAGES]:
                 page_raw = client.get(f"https://data.sec.gov/submissions/{page['name']}")
-                write_json(OUT / page["name"], page_raw)
+                write_json_gz(OUT / page["name"], page_raw)
 
         for cik in COMPANYFACTS.values():
             name = f"CIK{cik:010d}.json"
