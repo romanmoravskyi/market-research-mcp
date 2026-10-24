@@ -14,27 +14,34 @@ Read-only research. The user makes every investment decision.
 - The brief is research tooling output, not financial advice, and says so in its footer.
 
 ## Steps (in this order, all via MCP server `market-research`)
-1. `resolve_ticker(ticker)` -> name, CIK, exchange, SIC. Stop and report if not found.
+1. `resolve_ticker(query=<ticker>)` -> name, CIK, exchange, SIC. Stop and report if not found.
 2. `get_fundamentals(ticker, metrics=[revenue, net_income, diluted_eps, operating_cash_flow,
    capex, total_debt, cash, shares_diluted], periods="annual", n=5)`, then the same with
    `periods="quarterly", n=8`. Keep XBRL tag, period start/end and filed date per value.
+   If a note says a metric mixes XBRL tags, say so next to the affected rows and do not
+   compute growth or CAGR across the tag switch.
 3. Ratios: margins, revenue growth YoY and 3y CAGR, FCF, net debt, share-count change. Use
-   `get_key_ratios(ticker)` if the server lists it. Otherwise compute the ratios from the
-   step 2 `get_fundamentals` values and show the formula and inputs for each (e.g. "FCF =
-   operating_cash_flow - capex = $X - $Y"), citing the same sources.
+   `get_key_ratios(ticker)` if the server lists it for margins, ROE, ROA, debt/equity, current
+   ratio and FCF margin. It does not return revenue growth, CAGR, FCF (operating_cash_flow -
+   capex), net debt or share-count change, so always compute those from the step 2
+   `get_fundamentals` values. Without
+   `get_key_ratios`, compute all ratios from the step 2 `get_fundamentals` values. Show the
+   formula and inputs for each computed ratio (e.g. "FCF = operating_cash_flow - capex = $X -
+   $Y"), citing the same sources. If an input is null, the ratio is "n/a" with that reason.
 4. `get_price_stats(ticker)` -> 1m/3m/1y/5y returns, max drawdown, 52w range, volatility;
    record `provider` and `as_of`.
 5. Latest 10-K: `list_filings(ticker, forms=["10-K"], limit=1)`, then
    `get_filing_section(ticker, accession, "1A")` (pass the returned `next_cursor` as
    `cursor` until there is none). Summarize the top 5
    risks in one line each, in neutral words; cite the filing URL with accession number.
-6. Last 2 earnings releases: `list_filings(ticker, forms=["8-K"], since=<18 months ago>)`,
+6. Last 2 earnings releases: `list_filings(ticker, forms=["8-K"], since=<18 months ago>, limit=100)`,
    keep 8-Ks with Item 2.02, take the latest 2, `get_filing_exhibit(ticker, accession, "EX-99.1")`.
    Extract reported headline figures only (revenue, EPS, guidance if stated), each cited.
 7. Insiders, last 12 months: `get_insider_transactions(ticker, since=<12 months ago>)`.
    Headline: only codes P (open-market purchase) and S (open-market sale): counts, shares,
    value. All other codes (A, M, F, G, ...) go in a footnote as counts, labelled "not
-   open-market trades".
+   open-market trades". If `filings_capped` is true, the totals are complete only from
+   `covered_since`: state that window instead of "12 months".
 8. `get_earnings_calendar([ticker], days_ahead=120)` -> next earnings date, or "none found".
 9. Choose the output folder. Get `JOURNAL_DIR` from the same settings the server uses
    (environment, `MRM_ENV_FILE` or the per-user `.env`, then `.env` in the current folder).

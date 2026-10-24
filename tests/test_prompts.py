@@ -1,5 +1,6 @@
 """MCP prompt fallback for clients without skills: same procedure text as the skill."""
 
+import inspect
 import re
 from pathlib import Path
 
@@ -89,3 +90,82 @@ def test_skill_ratios_step_has_fallback():
     assert "get_key_ratios" in body
     assert "get_fundamentals" in body.split("get_key_ratios", 1)[1].split("\n4.", 1)[0]
     assert "formula" in body
+
+
+def _positional_mismatches(calls, signatures) -> list[str]:
+    """Problems with bare identifiers passed positionally: wrong name or too many args."""
+    problems = []
+    for name, arg_text in calls:
+        if name not in signatures:
+            continue
+        params = signatures[name]
+        for i, arg in enumerate(_split_args(arg_text)):
+            if "=" in arg:
+                break
+            if i >= len(params):
+                problems.append(
+                    f"{name}: {i + 1} positional arguments, function takes {len(params)}"
+                )
+                break
+            if re.fullmatch(r"[a-z_]+", arg) and arg != params[i]:
+                problems.append(f"{name}: positional '{arg}' is parameter '{params[i]}'")
+    return problems
+
+
+def _tool_signatures() -> dict[str, list[str]]:
+    # Positional order comes from the Python function, not the JSON schema's key order.
+    tools = build_server()._tool_manager.list_tools()
+    return {t.name: list(inspect.signature(t.fn).parameters) for t in tools}
+
+
+def test_skill_bare_positional_args_use_the_parameter_name():
+    # `resolve_ticker(ticker)` reads as a `ticker=` keyword, but the parameter is `query`;
+    # a bare identifier passed positionally must be the parameter's own name.
+    calls = CALL_RE.findall(SKILL_MD.read_text(encoding="utf-8"))
+    assert _positional_mismatches(calls, _tool_signatures()) == []
+
+
+def test_positional_check_reports_too_many_args_and_wrong_names():
+    # Review finding 8: no IndexError on extra arguments; a clear message instead.
+    sigs = {"resolve_ticker": ["query"]}
+    assert _positional_mismatches([("resolve_ticker", "query, extra")], sigs) == [
+        "resolve_ticker: 2 positional arguments, function takes 1"
+    ]
+    assert _positional_mismatches([("resolve_ticker", "ticker")], sigs) == [
+        "resolve_ticker: positional 'ticker' is parameter 'query'"
+    ]
+
+
+def test_skill_8k_listing_passes_a_limit_above_default():
+    # Default limit=20 truncates busy filers (JPM, O) within 18 months, which can hide
+    # Item 2.02 filings.
+    calls = [a for n, a in CALL_RE.findall(SKILL_MD.read_text(encoding="utf-8"))]
+    eight_k = [a for a in calls if '"8-K"' in a]
+    assert eight_k
+    for a in eight_k:
+        m = re.search(r"limit=(\d+)", a)
+        assert m and int(m.group(1)) >= 100, a
+
+
+def test_skill_ratios_step_computes_what_get_key_ratios_lacks():
+    step3 = _skill_body().split("\n3.", 1)[1].split("\n4.", 1)[0]
+    sentence = " ".join(step3.split("get_key_ratios", 1)[1].split())
+    for term in (
+        "growth",
+        "CAGR",
+        "FCF (operating_cash_flow - capex)",
+        "net debt",
+        "share-count change",
+    ):
+        assert term in sentence, term
+    assert "always" in sentence.lower()
+
+
+def test_skill_fundamentals_step_flags_mixed_tags():
+    step2 = " ".join(_skill_body().split("\n2.", 1)[1].split("\n3.", 1)[0].split())
+    assert "mixes XBRL tags" in step2 and "growth" in step2
+
+
+def test_skill_insiders_step_reports_covered_window_when_capped():
+    step7 = " ".join(_skill_body().split("\n7.", 1)[1].split("\n8.", 1)[0].split())
+    assert "filings_capped" in step7 and "covered_since" in step7

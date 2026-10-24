@@ -529,3 +529,77 @@ def test_negative_derived_net_income_is_kept():
 async def test_quarterly_notes_do_not_claim_ytd_excluded(sec):
     res = await xbrl.get_fundamentals("MSFT", metrics=["revenue"], periods="quarterly", n=1)
     assert not any("year-to-date 10-Q facts are excluded" in n for n in res.notes)
+
+
+def test_net_income_falls_back_to_available_to_common_when_net_income_loss_absent():
+    # Some filers (e.g. a REIT in its 2026 10-Qs) stop tagging NetIncomeLoss and tag only
+    # NetIncomeLossAvailableToCommonStockholdersBasic. Use it per period, and show its tag.
+    q = dict(form="10-Q", accession="0000000001-26-000001", filed="2026-05-07")
+    facts = [
+        fact("NetIncomeLoss", "2025-10-01", "2025-12-31", 90, form="10-Q"),
+        fact(
+            "NetIncomeLossAvailableToCommonStockholdersBasic",
+            "2025-10-01",
+            "2025-12-31",
+            88,
+            form="10-Q",
+        ),
+        fact(
+            "NetIncomeLossAvailableToCommonStockholdersBasic", "2026-01-01", "2026-03-31", 95, **q
+        ),
+    ]
+    vals = xbrl.normalize(facts, cik="1", metrics=["net_income"], periods="quarterly", n=2)
+    by_end = {v.period_end.isoformat(): v for v in vals}
+    assert by_end["2026-03-31"].value == 95
+    assert by_end["2026-03-31"].tag == "NetIncomeLossAvailableToCommonStockholdersBasic"
+    assert by_end["2025-12-31"].value == 90  # NetIncomeLoss still preferred when present
+    assert by_end["2025-12-31"].tag == "NetIncomeLoss"
+
+
+def _mixed_net_income_facts():
+    q = dict(form="10-Q", accession="0000000001-26-000001", filed="2026-05-07")
+    return [
+        fact("NetIncomeLoss", "2025-01-01", "2025-03-31", 80, form="10-Q"),
+        fact("NetIncomeLoss", "2025-01-01", "2025-12-31", 300),
+        fact("NetIncomeLoss", "2025-01-01", "2025-06-30", 160, form="10-Q"),
+        fact("NetIncomeLoss", "2025-01-01", "2025-09-30", 240, form="10-Q"),
+        fact(
+            "NetIncomeLossAvailableToCommonStockholdersBasic", "2026-01-01", "2026-03-31", 95, **q
+        ),
+        # A cumulative fact under the other tag must never feed a NetIncomeLoss derivation.
+        fact(
+            "NetIncomeLossAvailableToCommonStockholdersBasic",
+            "2025-01-01",
+            "2025-09-30",
+            230,
+            form="10-Q",
+        ),
+    ]
+
+
+def test_mixed_tag_series_gets_a_note_naming_both_measures():
+    # Review finding 4: a series that switches to the after-preferred-dividends tag must say
+    # so, because growth and margins across the switch compare different measures.
+    vals = xbrl.normalize(
+        _mixed_net_income_facts(), cik="1", metrics=["net_income"], periods="quarterly", n=8
+    )
+    notes = xbrl.mixed_tag_notes(vals)
+    assert len(notes) == 1
+    note = notes[0]
+    assert "net_income" in note
+    assert "NetIncomeLoss" in note and "NetIncomeLossAvailableToCommonStockholdersBasic" in note
+    assert "preferred" in note
+
+
+def test_derived_quarter_never_mixes_tags():
+    vals = xbrl.normalize(
+        _mixed_net_income_facts(), cik="1", metrics=["net_income"], periods="quarterly", n=8
+    )
+    q4 = next(v for v in vals if v.period_end.isoformat() == "2025-12-31")
+    assert q4.tag == "NetIncomeLoss" and q4.derived and q4.value == 60  # 300 - 240
+
+
+def test_single_tag_series_has_no_mixed_note():
+    facts = [fact("NetIncomeLoss", f"{y}-01-01", f"{y}-12-31", y) for y in (2023, 2024)]
+    vals = xbrl.normalize(facts, cik="1", metrics=["net_income"], periods="annual", n=5)
+    assert xbrl.mixed_tag_notes(vals) == []

@@ -155,6 +155,9 @@ class InsiderTransactions(SourcedList[InsiderTransaction]):
     since: date
     filings_fetched: int
     filings_capped: bool
+    # First filing date from which the summary is complete: `since`, or when capped the
+    # day after the newest filing that was cut off (see covered_since()).
+    covered_since: date
     summary: InsiderSummary
 
 
@@ -427,6 +430,18 @@ def browse_url(cik: str) -> str:
     )
 
 
+def covered_since(filings: list[Filing], cap: int, since: date) -> date:
+    """First filing date from which every Form 4 filing is among the newest `cap` fetched.
+
+    Uncapped: `since`. Capped: the day after the newest filing that was cut off, so a
+    boundary day with filings on both sides of the cap is never reported as covered.
+    """
+    cut = filings[cap:]
+    if not cut:
+        return since
+    return max(f.filing_date for f in cut) + timedelta(days=1)
+
+
 # ---------------------------------------------------------------- tool
 
 
@@ -451,6 +466,7 @@ async def get_insider_transactions(
     filings, _, sub = await list_filings_data(company.cik, forms=FORMS, since=since_date)
     capped = len(filings) > MAX_FILINGS
     total_filings = len(filings)
+    first_full_day = covered_since(filings, MAX_FILINGS, since_date)
     filings = filings[:MAX_FILINGS]
 
     notes: list[str] = [
@@ -463,7 +479,9 @@ async def get_insider_transactions(
     if capped:
         notes.append(
             f"Filings capped: fetched the newest {MAX_FILINGS} of {total_filings} Form 4 "
-            f"filings since {since_date.isoformat()}. Use a later `since` for full coverage."
+            f"filings since {since_date.isoformat()}; the summary covers filings from "
+            f"{first_full_day.isoformat()} (covered_since) onward. Use a later `since` for "
+            "full coverage."
         )
 
     sem = asyncio.Semaphore(FETCH_CONCURRENCY)
@@ -535,6 +553,7 @@ async def get_insider_transactions(
         since=since_date,
         filings_fetched=fetched,
         filings_capped=capped,
+        covered_since=first_full_day,
         summary=summary,
     )
 
