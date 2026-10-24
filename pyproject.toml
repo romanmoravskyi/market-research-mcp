@@ -38,6 +38,8 @@ dev = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# Live tests (real network and keys) are opt-in: `uv run pytest -m live` or `-m latency`.
+addopts = ["-m", "not live"]
 testpaths = ["tests"]
 markers = [
     "live: needs real API keys and network access (skipped in CI)",

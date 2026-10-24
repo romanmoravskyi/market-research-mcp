@@ -1,7 +1,8 @@
 """Latency targets from plans/01: under 20 s cold (empty cache), under 5 s warm.
 
 Live only: real network and keys. CI runs `-m "not live"`, so this never runs there.
-Run locally with the keys file pointed to by MRM_ENV_FILE:
+Deselected by default (pyproject `addopts = -m "not live"`). Run locally with the keys file
+pointed to by MRM_ENV_FILE:
 
     MRM_ENV_FILE=/path/to/.env uv run pytest -m latency -s
 
@@ -16,6 +17,7 @@ import time
 from typing import Any
 
 import pytest
+from dotenv import dotenv_values
 
 from market_research_mcp import cache as cache_mod
 from market_research_mcp import config, http
@@ -32,15 +34,20 @@ TICKER = "MSFT"
 
 @pytest.fixture
 def live_env(monkeypatch):
-    """Load the real keys from MRM_ENV_FILE (or the usual .env files) and restore env after."""
-    saved = dict(os.environ)
-    config.load_env_files()
+    """Apply the real keys from MRM_ENV_FILE (or the usual .env files) via monkeypatch.
+
+    Values go through monkeypatch.setenv, so os.environ is restored on every path, skips
+    included. Values already set in the environment win, as in `config.load_env_files`.
+    """
+    for path in config.dotenv_paths():
+        if path.is_file():
+            for name, value in dotenv_values(path).items():
+                if value is not None and name not in os.environ:
+                    monkeypatch.setenv(name, value)
     config.get_settings.cache_clear()
     if not os.environ.get("SEC_USER_AGENT"):
         pytest.skip("SEC_USER_AGENT not set; point MRM_ENV_FILE at a .env with real keys")
     yield
-    os.environ.clear()
-    os.environ.update(saved)
     config.get_settings.cache_clear()
 
 

@@ -28,6 +28,7 @@ from market_research_mcp import cache as cache_mod
 from market_research_mcp import http
 from market_research_mcp.cache import Cache
 from market_research_mcp.config import Settings
+from market_research_mcp.logging_setup import SECRET_KEYS
 from market_research_mcp.ratelimit import reset_limiters
 from market_research_mcp.server import build_server
 from market_research_mcp.sources import calendar, edgar, prices, xbrl
@@ -84,7 +85,22 @@ PROMPT_CASES: dict[str, dict[str, str]] = {
 UNSOURCED_TOOLS = {"ping"}
 
 SOURCE_FIELDS = ("source", "source_url", "retrieved_at", "as_of")
-LEAKY_URL = re.compile(r"api_key|apikey|token=|user-agent|user_agent|@", re.IGNORECASE)
+SECRET_PARAMS = (*SECRET_KEYS, "access_token", "auth", "secret", "password", "sig", "signature")
+REDACTED_VALUES = {"", "***", "redacted", "xxx"}
+_SECRET_PARAM = re.compile(
+    r"[?&;](?:" + "|".join(SECRET_PARAMS) + r")=(?P<value>[^&#;\s]*)", re.IGNORECASE
+)
+_USER_AGENT = re.compile(r"user[-_]?agent|@", re.IGNORECASE)
+
+
+def url_leak(url: str) -> str | None:
+    """Why `url` leaks a secret or User-Agent, or None. Redacted values (`***`) are fine."""
+    for match in _SECRET_PARAM.finditer(url):
+        if match.group("value").lower() not in REDACTED_VALUES:
+            return f"secret query parameter {match.group(0)!r}"
+    if _USER_AGENT.search(url):
+        return "User-Agent or e-mail in URL"
+    return None
 
 
 def _registered_tool_names() -> list[str]:
@@ -171,7 +187,6 @@ def fixtures_only():
             m.get(f"{ARCHIVE}{accession.replace('-', '')}/{doc_name}").mock(
                 return_value=httpx.Response(200, content=_gz(path))
             )
-        m.get(url__startswith=ARCHIVE).mock(return_value=httpx.Response(404))
         # Prices (synthetic Tiingo fixture).
         m.get(url__regex=r"https://api\.tiingo\.com/tiingo/daily/msft/prices.*").mock(
             return_value=httpx.Response(200, content=_gz(FIXTURES / "tiingo/msft_prices.json.gz"))
@@ -200,31 +215,25 @@ def _is_number(value: Any) -> bool:
     return isinstance(value, int | float) and not isinstance(value, bool)
 
 
-REASON_FIELDS = ("reason", "note", "notes")
-
-
 def provenance_violations(node: Any, path: str = "$", owner: dict | None = None) -> list[str]:
     """Every number must sit inside an item whose provenance is complete.
 
     An item declares provenance when it has any of SOURCE_FIELDS. Nested items inherit the
-    fields they do not set (or set to null) from the enclosing item, so a top-level `Sourced`
-    result covers its rows. Each field must resolve to a non-empty value; `as_of` may be null
-    only with a documented reason (`reason`, `note` or `notes`) on the item or its owner.
+    fields they do not have at all from the enclosing item, so a top-level `Sourced` result
+    covers its rows. A field an item does carry must be non-empty (`as_of` non-null): notes
+    never excuse a gap. The one exception is an explicit null figure, `value: null`, with a
+    non-empty `reason` on the same item: it carries no number, so it needs no provenance.
     """
     problems: list[str] = []
     if isinstance(node, dict):
         if any(f in node for f in SOURCE_FIELDS):
+            null_with_reason = "value" in node and node["value"] is None and node.get("reason")
             inherited = owner or {}
-            owner = {
-                f: node[f] if node.get(f) not in (None, "") else inherited.get(f)
-                for f in (*SOURCE_FIELDS, *REASON_FIELDS)
-            }
-            documented = any(owner.get(f) for f in REASON_FIELDS)
-            for field in ("source", "source_url", "retrieved_at"):
-                if not owner.get(field) and not documented:
-                    problems.append(f"{path}.{field}: missing or empty without a reason")
-            if owner.get("as_of") is None and not documented:
-                problems.append(f"{path}.as_of: null without a reason")
+            owner = {f: node[f] if f in node else inherited.get(f) for f in SOURCE_FIELDS}
+            if not null_with_reason:
+                for field in SOURCE_FIELDS:
+                    if owner.get(field) in (None, ""):
+                        problems.append(f"{path}.{field}: missing, empty or null")
         for key, value in node.items():
             problems += provenance_violations(value, f"{path}.{key}", owner)
     elif isinstance(node, list):
@@ -249,20 +258,56 @@ def source_urls(node: Any) -> list[str]:
 
 
 def test_provenance_helper_flags_unsourced_numbers():
-    assert provenance_violations({"x": 1})
-    assert provenance_violations(
-        {"source": "S", "source_url": "u", "retrieved_at": "t", "as_of": None}
-    )
-    assert not provenance_violations(
-        {"source": "S", "source_url": "u", "retrieved_at": "t", "as_of": "d", "v": [1, 2.5]}
-    )
-    assert not provenance_violations(
-        {"source": "S", "source_url": "u", "retrieved_at": "t", "as_of": None, "notes": ["why"]}
-    )
-    # Rows inherit from the enclosing result; a row may override its own URL.
     top = {"source": "S", "source_url": "u", "retrieved_at": "t", "as_of": "d"}
+    assert provenance_violations({"x": 1})
+    assert not provenance_violations({**top, "v": [1, 2.5]})
+    # Rows inherit fields they lack; a row may override its own URL.
     assert not provenance_violations({**top, "rows": [{"source_url": "u2", "value": 3}]})
     assert provenance_violations({"rows": [{"source_url": "u2", "as_of": None, "v": 3}]})
+    # Notes never excuse a gap, on the item or inherited from the result.
+    assert provenance_violations({**top, "as_of": None, "notes": ["why"]})
+    assert provenance_violations({**top, "source": None, "notes": ["why"], "v": 1})
+    noted = {**top, "notes": ["a note"]}
+    assert provenance_violations({**noted, "rows": [{"source_url": "", "value": 3}]})
+    assert provenance_violations({**noted, "rows": [{"as_of": None, "value": 3}]})
+    assert provenance_violations({**top, "rows": [{"as_of": None, "note": "n", "value": 3}]})
+    # Only an explicit null figure with a reason may skip the check.
+    assert not provenance_violations(
+        {**top, "rows": [{"source_url": None, "as_of": None, "value": None, "reason": "why"}]}
+    )
+    assert provenance_violations(
+        {**top, "rows": [{"source_url": None, "as_of": None, "value": None}]}
+    )
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://x.test/a?api_key=abc",
+        "https://x.test/a?symbol=MSFT&token=abc",
+        "https://x.test/a?key=abc",
+        "https://x.test/a?x=1&t=abc",
+        "https://x.test/a?apikey=abc",
+        "https://x.test/a?access_token=abc",
+        "https://x.test/a?ua=Name%20name@example.test",
+        "https://x.test/user-agent/a",
+    ],
+)
+def test_url_leak_flags_secrets(url):
+    assert url_leak(url)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://fred.stlouisfed.org/series/DGS10",
+        "https://x.test/a?api_key=***&symbol=MSFT",
+        "https://x.test/a?token=",
+        "https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&type=10-K",
+    ],
+)
+def test_url_leak_allows_clean_and_redacted(url):
+    assert url_leak(url) is None
 
 
 def test_every_tool_has_a_contract_case():
@@ -298,9 +343,9 @@ async def test_tool_contract(name, fixtures_only):
         assert "source" in json.dumps(structured)
 
     for url in source_urls(structured):
-        assert not LEAKY_URL.search(url), f"source_url leaks a secret or User-Agent: {url}"
+        assert url_leak(url) is None, f"{url_leak(url)}: {url}"
     dumped = json.dumps(structured)
-    for secret in (*KEYS.values(), UA):
+    for secret in (*KEYS.values(), UA, "Bearer "):
         assert secret not in dumped
 
 
