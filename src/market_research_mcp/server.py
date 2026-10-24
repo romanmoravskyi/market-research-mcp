@@ -8,6 +8,7 @@ import logging
 
 from mcp.server.fastmcp import FastMCP
 
+from market_research_mcp import prompts
 from market_research_mcp.config import load_settings
 from market_research_mcp.logging_setup import setup_logging
 from market_research_mcp.sources import (
@@ -32,6 +33,7 @@ SOURCE_MODULES = [
     insiders,
     xbrl,
     calendar,
+    prompts,
 ]
 
 logger = logging.getLogger(__name__)

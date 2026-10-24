@@ -41,6 +41,12 @@ async def test_full_tool_set_registered():
     assert EXPECTED_TOOLS <= tools, f"missing: {sorted(EXPECTED_TOOLS - tools)}"
 
 
+async def test_analyze_ticker_prompt_listed():
+    mcp = build_server()
+    prompts = {p.name for p in await mcp.list_prompts()}
+    assert "analyze_ticker" in prompts
+
+
 def test_require_raises_naming_var(monkeypatch):
     monkeypatch.delenv("FRED_API_KEY", raising=False)
     with pytest.raises(ConfigError, match="FRED_API_KEY"):
