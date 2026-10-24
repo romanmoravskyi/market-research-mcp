@@ -529,3 +529,28 @@ def test_negative_derived_net_income_is_kept():
 async def test_quarterly_notes_do_not_claim_ytd_excluded(sec):
     res = await xbrl.get_fundamentals("MSFT", metrics=["revenue"], periods="quarterly", n=1)
     assert not any("year-to-date 10-Q facts are excluded" in n for n in res.notes)
+
+
+def test_net_income_falls_back_to_available_to_common_when_net_income_loss_absent():
+    # Some filers (e.g. a REIT in its 2026 10-Qs) stop tagging NetIncomeLoss and tag only
+    # NetIncomeLossAvailableToCommonStockholdersBasic. Use it per period, and show its tag.
+    q = dict(form="10-Q", accession="0000000001-26-000001", filed="2026-05-07")
+    facts = [
+        fact("NetIncomeLoss", "2025-10-01", "2025-12-31", 90, form="10-Q"),
+        fact(
+            "NetIncomeLossAvailableToCommonStockholdersBasic",
+            "2025-10-01",
+            "2025-12-31",
+            88,
+            form="10-Q",
+        ),
+        fact(
+            "NetIncomeLossAvailableToCommonStockholdersBasic", "2026-01-01", "2026-03-31", 95, **q
+        ),
+    ]
+    vals = xbrl.normalize(facts, cik="1", metrics=["net_income"], periods="quarterly", n=2)
+    by_end = {v.period_end.isoformat(): v for v in vals}
+    assert by_end["2026-03-31"].value == 95
+    assert by_end["2026-03-31"].tag == "NetIncomeLossAvailableToCommonStockholdersBasic"
+    assert by_end["2025-12-31"].value == 90  # NetIncomeLoss still preferred when present
+    assert by_end["2025-12-31"].tag == "NetIncomeLoss"

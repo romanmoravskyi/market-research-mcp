@@ -106,7 +106,11 @@ METRICS: dict[str, MetricSpec] = {
     ),
     "gross_profit": MetricSpec("duration", "USD", ("GrossProfit",)),
     "operating_income": MetricSpec("duration", "USD", ("OperatingIncomeLoss",)),
-    "net_income": MetricSpec("duration", "USD", ("NetIncomeLoss",)),
+    # Fallback for filers that tag only net income available to common stockholders (after
+    # preferred dividends); the tag shown per value says which one was used.
+    "net_income": MetricSpec(
+        "duration", "USD", ("NetIncomeLoss", "NetIncomeLossAvailableToCommonStockholdersBasic")
+    ),
     "diluted_eps": MetricSpec(
         "duration", "USD/shares", ("EarningsPerShareDiluted", "EarningsPerShareBasicAndDiluted")
     ),
