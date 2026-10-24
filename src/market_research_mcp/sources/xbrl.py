@@ -43,6 +43,7 @@ __all__ = [
     "duration_facts",
     "fiscal_year_for",
     "get_fundamentals",
+    "load_company_facts",
     "normalize",
     "parse_facts",
     "register",
@@ -139,6 +140,19 @@ METRICS: dict[str, MetricSpec] = {
         ),
     ),
     "cash": MetricSpec("instant", "USD", ("CashAndCashEquivalentsAtCarryingValue", "Cash")),
+    # Equity attributable to the parent first (matches NetIncomeLoss), then including
+    # noncontrolling interests.
+    "stockholders_equity": MetricSpec(
+        "instant",
+        "USD",
+        (
+            "StockholdersEquity",
+            "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+        ),
+    ),
+    "total_assets": MetricSpec("instant", "USD", ("Assets",)),
+    "current_assets": MetricSpec("instant", "USD", ("AssetsCurrent",)),
+    "current_liabilities": MetricSpec("instant", "USD", ("LiabilitiesCurrent",)),
     "shares_diluted": MetricSpec(
         "duration",
         "shares",
@@ -695,6 +709,17 @@ def _cover(
 # ---------------------------------------------------------------- tool
 
 
+async def load_company_facts(ticker: str) -> tuple[edgar.CompanyRef, str, Any, list[Fact]]:
+    """Resolve `ticker` and fetch its companyfacts: (company, url, fetch result, facts)."""
+    company = await edgar.get_company(ticker)
+    url = companyfacts_url(company.cik)
+    res = await http.fetch("edgar", url, cache_ns="companyfacts", cache_key=f"CIK{company.cik}")
+    facts = parse_facts(res.data)
+    if not facts:
+        raise NotFound(f"XBRL facts for {company.ticker}", SOURCE)
+    return company, url, res, facts
+
+
 async def get_fundamentals(
     ticker: str,
     metrics: list[str] | None = None,
@@ -704,8 +729,9 @@ async def get_fundamentals(
     """Company fundamentals from SEC XBRL filings (10-K/10-Q), newest period first.
 
     metrics: any of revenue, gross_profit, operating_income, net_income, diluted_eps,
-    basic_eps, operating_cash_flow, capex, total_debt, cash, shares_diluted,
-    shares_outstanding (default: all). periods: "annual" or "quarterly". n: number of
+    basic_eps, operating_cash_flow, capex, total_debt, cash, stockholders_equity,
+    total_assets, current_assets, current_liabilities, shares_diluted, shares_outstanding
+    (default: all). periods: "annual" or "quarterly". n: number of
     periods (1-40). Each value carries the XBRL tag used, the period dates, the filing's
     form, accession, filed date and URL. Missing values are null with a reason.
     Source: SEC EDGAR XBRL companyfacts.
@@ -720,12 +746,7 @@ async def get_fundamentals(
         raise BadInput(f"unknown metrics {unknown}; valid metrics: {', '.join(METRICS)}")
     names = names or list(METRICS)
 
-    company = await edgar.get_company(ticker)
-    url = companyfacts_url(company.cik)
-    res = await http.fetch("edgar", url, cache_ns="companyfacts", cache_key=f"CIK{company.cik}")
-    facts = parse_facts(res.data)
-    if not facts:
-        raise NotFound(f"XBRL facts for {company.ticker}", SOURCE)
+    company, url, res, facts = await load_company_facts(ticker)
     splits = detect_splits(facts)
     values = normalize(facts, cik=company.cik, metrics=names, periods=periods, n=n, splits=splits)
     filed = [v.filed for v in values if v.filed is not None]
