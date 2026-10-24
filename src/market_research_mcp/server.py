@@ -48,9 +48,21 @@ def build_server() -> FastMCP:
     return mcp
 
 
+def _preload_native_libraries() -> None:
+    """Load numpy before the stdio transport starts.
+
+    On Windows, numpy's first import (it loads native DLLs) deadlocks while the transport
+    has a blocking read pending on stdin. edgartools imports numpy lazily inside a worker
+    thread, so get_filing_section and get_filing_exhibit hung until the client timed out.
+    Importing it here costs well under a second.
+    """
+    import numpy  # noqa: F401
+
+
 def main() -> None:
     settings = load_settings()
     setup_logging(settings.log_level)
+    _preload_native_libraries()
     mcp = build_server()
     logger.info("Starting %s over stdio", SERVER_NAME)
     mcp.run(transport="stdio")
