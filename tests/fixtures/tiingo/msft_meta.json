@@ -1,0 +1,8 @@
+{
+  "ticker": "MSFT",
+  "name": "Synthetic Test Corp (fake data)",
+  "exchangeCode": "NASDAQ",
+  "startDate": "2020-10-26",
+  "endDate": "2026-10-23",
+  "description": "Synthetic fixture. Not real market data."
+}

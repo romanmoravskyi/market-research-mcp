@@ -10,12 +10,15 @@ from mcp.server.fastmcp import FastMCP
 
 from market_research_mcp.config import load_settings
 from market_research_mcp.logging_setup import setup_logging
-from market_research_mcp.sources import health
+from market_research_mcp.sources import edgar, fred, health, prices
 
 SERVER_NAME = "market-research"
 
 SOURCE_MODULES = [
     health,
+    edgar,
+    fred,
+    prices,
 ]
 
 logger = logging.getLogger(__name__)
