@@ -1,5 +1,6 @@
 import gzip
 import os
+import re
 from datetime import date
 
 import httpx
@@ -17,6 +18,9 @@ from market_research_mcp.sources import edgar
 FIXTURES = SEC_FIXTURES
 SUB = "https://data.sec.gov/submissions/"
 PLACEHOLDER_UA = "Test Agent test@example.test"
+EMPTY_ATOM = (
+    b'<?xml version="1.0" encoding="ISO-8859-1" ?><feed xmlns="http://www.w3.org/2005/Atom"/>'
+)
 
 
 @pytest.fixture(autouse=True)
@@ -49,6 +53,10 @@ def sec(ua):
             routes[name.removesuffix(".json")] = mock.get(SUB + name).mock(
                 return_value=httpx.Response(200, json=load_sec_fixture(path.name))
             )
+        # EDGAR company browse Atom feed: empty by default; tests swap in recorded feeds.
+        routes["atom"] = mock.get(host="www.sec.gov", path="/cgi-bin/browse-edgar").mock(
+            return_value=httpx.Response(200, content=EMPTY_ATOM)
+        )
         routes["_router"] = mock
         yield routes
 
@@ -222,6 +230,15 @@ def test_fixtures_have_no_user_agent():
         assert "user-agent" not in text.lower(), path
 
 
+def test_atom_fixtures_have_no_user_agent():
+    paths = sorted(FIXTURES.glob("atom-*.xml.gz"))
+    assert paths
+    for path in paths:
+        text = gzip.decompress(path.read_bytes()).decode("latin-1")
+        assert set(re.findall(r"[\w.+-]+@[\w.-]+", text)) <= {"webmaster@sec.gov"}, path
+        assert "user-agent" not in text.lower(), path
+
+
 def test_fixtures_are_compressed():
     assert not list(FIXTURES.glob("*.json")), "store SEC fixtures as .json.gz"
 
@@ -343,3 +360,102 @@ async def test_ambiguous_name_not_found_with_suggestions(sec):
 async def test_nonsense_name_not_found(sec):
     with pytest.raises(NotFound):
         await edgar.get_company("qwxzv plorkington")
+
+
+# ---------------------------------------------------------------- F3 Atom feed fallback
+
+JPM_ATOM = "atom-CIK0000019617-10-K.xml.gz"
+
+
+def _jpm_atom(sec):
+    """Serve the recorded JPM 10-K Atom feed; pages 002+ are empty so paging hits the cap."""
+    raw = gzip.decompress((FIXTURES / JPM_ATOM).read_bytes())
+    sec["atom"].mock(return_value=httpx.Response(200, content=raw))
+    for n in range(2, 30):
+        sec["_router"].get(_jpm_page(n)).mock(return_value=httpx.Response(200, json=_empty_block()))
+    return sec["atom"]
+
+
+async def test_list_filings_jpm_10k_atom_fallback(sec):
+    atom = _jpm_atom(sec)
+    r = await edgar.list_filings("JPM", forms=["10-K"], limit=3)
+    assert [f.accession for f in r.items] == [
+        "0001628280-26-008131",
+        "0000019617-25-000270",
+        "0000019617-24-000225",
+    ]
+    assert [f.filing_date for f in r.items] == [
+        date(2026, 2, 13),
+        date(2025, 2, 14),
+        date(2024, 2, 16),
+    ]
+    assert all(f.form == "10-K" for f in r.items)
+    # The newest comes from the submissions recent block (with its primary document).
+    assert r.items[0].primary_document
+    # Feed-only filings point at the public filing index page.
+    assert r.items[1].url == (
+        "https://www.sec.gov/Archives/edgar/data/19617/000001961725000270/"
+        "0000019617-25-000270-index.htm"
+    )
+    assert atom.call_count == 1
+    req = atom.calls.last.request
+    assert req.headers["User-Agent"] == PLACEHOLDER_UA
+    q = dict(req.url.params)
+    assert q["action"] == "getcompany" and q["CIK"] == "0000019617"
+    assert q["type"] == "10-K" and q["output"] == "atom"
+    assert r.truncated
+    assert not any("older matching filings may exist" in n for n in r.notes)
+    assert any("browse-edgar" in n and "output=atom" in n for n in r.notes)
+    assert all("Test Agent" not in n for n in r.notes)
+    edgar.FilingList.model_validate(r.model_dump(mode="json"))
+
+
+async def test_atom_fallback_exact_form_semantics(sec):
+    # type=10-K in the feed is a prefix match (10-K/A, 10-K405 too); the filter stays exact.
+    _jpm_atom(sec)
+    r = await edgar.list_filings("JPM", forms=["10-K"], limit=50)
+    assert all(f.form == "10-K" for f in r.items)
+    accs = [f.accession for f in r.items]
+    assert len(accs) == len(set(accs)) == 26
+    assert accs[-1] == "0000950123-97-002412"
+    keys = [(f.filing_date, f.accession) for f in r.items]
+    assert keys == sorted(keys, reverse=True)
+
+
+async def test_atom_fallback_cached(sec):
+    atom = _jpm_atom(sec)
+    await edgar.list_filings("JPM", forms=["10-K"], limit=3)
+    again = await edgar.list_filings("JPM", forms=["10-K"], limit=3)
+    assert atom.call_count == 1
+    assert len(again.items) == 3
+
+
+@pytest.mark.parametrize(("ticker", "limit"), [("MSFT", 3), ("MSFT", 10), ("AAPL", 3)])
+async def test_no_atom_request_when_submissions_suffice(sec, ticker, limit):
+    if ticker == "AAPL":
+        # No recorded AAPL submissions: a synthetic recent block with three 10-Ks.
+        block = _empty_block()
+        for year in (2025, 2024, 2023):
+            block["accessionNumber"].append(f"0000320193-{year % 100}-000001")
+            block["filingDate"].append(f"{year}-11-01")
+            block["reportDate"].append(f"{year}-09-27")
+            block["form"].append("10-K")
+            block["primaryDocument"].append("aapl-10k.htm")
+            block["items"].append("")
+        sec["_router"].get(SUB + "CIK0000320193.json").mock(
+            return_value=httpx.Response(
+                200, json={"name": "Apple Inc.", "filings": {"recent": block, "files": []}}
+            )
+        )
+    r = await edgar.list_filings(ticker, forms=["10-K"], limit=limit)
+    assert len(r.items) == limit
+    assert not sec["atom"].called
+    assert not any("browse-edgar" in n for n in r.notes)
+
+
+async def test_atom_feed_failure_keeps_capped_note(sec):
+    _jpm_atom(sec)
+    sec["atom"].mock(return_value=httpx.Response(200, content=b"<html>not a feed"))
+    r = await edgar.list_filings("JPM", forms=["10-K"], limit=3)
+    assert len(r.items) == 1 and r.truncated
+    assert any("older" in n for n in r.notes)

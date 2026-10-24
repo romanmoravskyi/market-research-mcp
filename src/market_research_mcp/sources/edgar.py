@@ -8,15 +8,17 @@ All HTTP goes through `http.fetch("edgar", ...)`, which sets the User-Agent and 
 from __future__ import annotations
 
 import re
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
 
+import httpx
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel
 
 from market_research_mcp import http
-from market_research_mcp.errors import BadInput, NotFound
+from market_research_mcp.errors import BadInput, NotFound, ProviderDown, RateLimited
 from market_research_mcp.models import Sourced, SourcedList
 from market_research_mcp.tickers import canonical_ticker, normalize_ticker
 
@@ -28,6 +30,7 @@ __all__ = [
     "FilingList",
     "ResolvedTicker",
     "accession_url",
+    "atom_feed_url",
     "get_cik",
     "get_company",
     "get_submissions",
@@ -45,6 +48,9 @@ SOURCE = "SEC EDGAR"
 TICKERS_URL = "https://www.sec.gov/files/company_tickers_exchange.json"
 SUBMISSIONS_BASE = "https://data.sec.gov/submissions/"
 ARCHIVES_BASE = "https://www.sec.gov/Archives/edgar/data/"
+BROWSE_URL = "https://www.sec.gov/cgi-bin/browse-edgar"
+ATOM_COUNT = 40  # entries per EDGAR browse Atom feed request
+_ATOM_NS = {"a": "http://www.w3.org/2005/Atom"}
 MAX_LIMIT = 200
 MAX_EXTRA_PAGES = 5  # older submission pages fetched to satisfy a form filter
 MAX_SUGGESTIONS = 3
@@ -313,6 +319,67 @@ def _rows(block: dict[str, Any], cik: str) -> list[Filing]:
     return out
 
 
+def atom_feed_url(cik: int | str, form: str) -> str:
+    """Public EDGAR company browse Atom feed URL for one form type (newest first)."""
+    return str(
+        httpx.URL(
+            BROWSE_URL,
+            params={
+                "action": "getcompany",
+                "CIK": pad_cik(cik),
+                "type": form,
+                "dateb": "",
+                "owner": "include",
+                "count": ATOM_COUNT,
+                "output": "atom",
+            },
+        )
+    )
+
+
+def _atom_rows(raw: bytes) -> list[Filing]:
+    """Filings from an EDGAR browse Atom feed. Feed entries carry no primary document or
+    report date; `url` is the filing index page. Raises ValueError if it is not a feed."""
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError as exc:
+        raise ValueError("not an Atom feed") from exc
+    if root.tag != "{http://www.w3.org/2005/Atom}feed":
+        raise ValueError("not an Atom feed")
+    out: list[Filing] = []
+    for entry in root.iterfind("a:entry", _ATOM_NS):
+        content = entry.find("a:content", _ATOM_NS)
+        if content is None:
+            continue
+
+        def text(tag: str, content: ET.Element = content) -> str:
+            return (content.findtext(f"a:{tag}", default="", namespaces=_ATOM_NS)).strip()
+
+        accession, filed = text("accession-number"), _parse_date(text("filing-date"))
+        if not accession or filed is None:
+            continue
+        out.append(
+            Filing(
+                form=text("filing-type"),
+                filing_date=filed,
+                accession=accession,
+                url=text("filing-href") or None,
+            )
+        )
+    return out
+
+
+async def _atom_filings(cik: int | str, form: str) -> tuple[list[Filing], str] | None:
+    """Filings of one form type from the browse Atom feed, or None if it is unusable."""
+    url = atom_feed_url(cik, form)
+    key = f"atom-CIK{pad_cik(cik)}-{form}"
+    try:
+        res = await http.fetch("edgar", url, cache_ns="submissions", cache_key=key, parse="bytes")
+        return _atom_rows(res.data), url
+    except (ValueError, NotFound, ProviderDown, RateLimited):
+        return None
+
+
 def _older_pages(filings_block: dict[str, Any]) -> list[dict[str, Any]]:
     """Older submission pages, newest first."""
     pages = list(filings_block.get("files", []))
@@ -326,8 +393,9 @@ async def _collect_filings(
     since: date | None,
     limit: int | None,
     max_extra_pages: int,
-) -> tuple[list[Filing], bool, Submissions, bool]:
-    """`list_filings_data` plus a last flag: True when form-driven paging hit the page cap."""
+) -> tuple[list[Filing], bool, Submissions, bool, list[str]]:
+    """`list_filings_data` plus: True when form-driven paging hit the page cap (and the Atom
+    feed did not make up the shortfall), and the Atom feed URLs that contributed filings."""
     sub = await get_submissions(cik)
     cik10 = pad_cik(cik)
     filings_block = sub.data.get("filings", {})
@@ -340,6 +408,7 @@ async def _collect_filings(
         )
 
     capped = False
+    feed_urls: list[str] = []
     if since is not None:
         earliest = min((f.filing_date for f in rows), default=None)
         if earliest is None or earliest > since:
@@ -364,13 +433,31 @@ async def _collect_filings(
             fetched += 1
             rows.extend(page_rows)
             found += sum(1 for f in page_rows if keep(f))
+        if found < target:
+            # Some filers' periodic forms sit dozens of pages back (JPM's 10-Ks are in pages
+            # 008, 018, 027). The browse Atom feed lists one form type directly.
+            seen = {f.accession for f in rows}
+            for form in sorted(wanted):
+                feed = await _atom_filings(cik10, form)
+                if feed is None:
+                    continue
+                feed_rows, url = feed
+                new = [f for f in feed_rows if f.accession not in seen]
+                seen.update(f.accession for f in new)
+                rows.extend(new)
+                added = sum(1 for f in new if keep(f))
+                if added:
+                    found += added
+                    feed_urls.append(url)
+            if found >= target:
+                capped = False
 
     out = [f for f in rows if keep(f)]
     out.sort(key=lambda f: (f.filing_date, f.accession), reverse=True)
     truncated = capped
     if limit is not None and len(out) > limit:
         out, truncated = out[:limit], True
-    return out, truncated, sub, capped
+    return out, truncated, sub, capped, feed_urls
 
 
 async def list_filings_data(
@@ -386,10 +473,13 @@ async def list_filings_data(
     Returns (filings, truncated, submissions). Older submission pages are fetched when
     `since` reaches earlier than the `recent` block, or when a `forms` filter finds fewer
     than `limit` matches in `recent` (no match at all, when limit is None). Form-driven
-    paging stops after `max_extra_pages` pages; `truncated` is then True because older
-    matches may exist.
+    paging stops after `max_extra_pages` pages. If paging still finds fewer than `limit`
+    matches, the EDGAR company browse Atom feed (one request per form type, cached like
+    submissions) fills the gap; feed filings have no primary document and link to the filing
+    index page. `truncated` is True when the page cap was hit and the feed did not make up
+    the shortfall, because older matches may exist.
     """
-    out, truncated, sub, _ = await _collect_filings(cik, forms, since, limit, max_extra_pages)
+    out, truncated, sub, _, _ = await _collect_filings(cik, forms, since, limit, max_extra_pages)
     return out, truncated, sub
 
 
@@ -432,7 +522,7 @@ async def list_filings(
     if limit < 1 or limit > MAX_LIMIT:
         raise BadInput(f"limit must be between 1 and {MAX_LIMIT}")
     company = await get_company(ticker)
-    items, truncated, sub, capped = await _collect_filings(
+    items, truncated, sub, capped, feed_urls = await _collect_filings(
         company.cik, forms, since_date, limit, MAX_EXTRA_PAGES
     )
     latest = max((f.filing_date for f in items), default=None)
@@ -442,6 +532,7 @@ async def list_filings(
             f"Searched the recent block and {MAX_EXTRA_PAGES} older submission pages only; "
             "older matching filings may exist. Pass `since` to search further back."
         )
+    notes += [f"Older filings also from the EDGAR browse feed {url}" for url in feed_urls]
     return FilingList(
         source=SOURCE,
         source_url=sub.url,
