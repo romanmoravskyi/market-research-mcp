@@ -28,6 +28,7 @@ EXPECTED_TOOLS = {
     "get_filing_exhibit",
     "get_insider_transactions",
     "get_fundamentals",
+    "get_key_ratios",
     "get_price_history",
     "get_price_stats",
     "get_earnings_calendar",

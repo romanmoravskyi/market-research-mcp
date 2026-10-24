@@ -16,7 +16,14 @@ from market_research_mcp.sources import edgar, xbrl
 from market_research_mcp.sources.xbrl import Fact
 
 SEC = Path(__file__).parent / "fixtures" / "sec"
-CIKS = {"MSFT": "789019", "JPM": "19617", "O": "726728", "NVDA": "1045810"}
+CIKS = {
+    "MSFT": "789019",
+    "JPM": "19617",
+    "O": "726728",
+    "NVDA": "1045810",
+    "AAPL": "320193",
+    "BRK-B": "1067983",
+}
 
 
 def load_tickers() -> dict:
@@ -200,17 +207,25 @@ async def test_source_fields(sec):
     xbrl.Fundamentals.model_validate(res.model_dump(mode="json"))
 
 
-async def test_quarterly_only_true_quarters(sec):
-    res = await xbrl.get_fundamentals("MSFT", metrics=["revenue"], periods="quarterly", n=3)
-    got = [(v.period_end, v.value, v.fiscal_year, v.fiscal_period) for v in res.values]
-    # Q4 (Apr-Jun) is never reported as a 3-month fact, so it is absent until T9 derives it.
+async def test_quarterly_reported_quarters_plus_derived_q4(sec):
+    res = await xbrl.get_fundamentals("MSFT", metrics=["revenue"], periods="quarterly", n=4)
+    got = [(v.period_end, v.value, v.fiscal_year, v.fiscal_period, v.derived) for v in res.values]
+    # Q4 (Apr-Jun) is never reported as a 3-month fact: FY 10-K 0001193125-26-323660
+    # ($331,839M) minus 9M YTD 10-Q 0001193125-26-191507 ($241,832M) = $90,007M.
     assert got == [
-        (date(2026, 3, 31), 82_886_000_000, 2026, "Q3"),
-        (date(2025, 12, 31), 81_273_000_000, 2026, "Q2"),
-        (date(2025, 9, 30), 77_673_000_000, 2026, "Q1"),
+        (date(2026, 6, 30), 90_007_000_000, 2026, "Q4", True),
+        (date(2026, 3, 31), 82_886_000_000, 2026, "Q3", False),
+        (date(2025, 12, 31), 81_273_000_000, 2026, "Q2", False),
+        (date(2025, 9, 30), 77_673_000_000, 2026, "Q1", False),
     ]
     for v in res.values:
         assert 80 <= (v.period_end - v.period_start).days <= 100
+    q4 = res.values[0]
+    assert q4.period_start == date(2026, 4, 1)
+    assert "FY - 9M YTD" in q4.note and "0001193125-26-191507" in q4.note
+    assert q4.accession == "0001193125-26-323660"
+    assert any("FY - 9M YTD" in n for n in res.notes)
+    assert not any("not derived yet" in n for n in res.notes)
 
 
 async def test_shares_outstanding_from_cover_page(sec):
@@ -254,3 +269,263 @@ async def test_cover_share_count_dated_on_period_end_stays_with_that_period(sec)
 def test_fiscal_label_extrapolates_outside_annual_periods(end, label):
     fy_ends = [date(2024, 6, 30), date(2025, 6, 30)]
     assert xbrl._fiscal_label(end, "quarterly", fy_ends) == label
+
+
+# ---------------------------------------------------------------- derived quarters (T9)
+
+
+def _cal_year(concept: str, values: dict[str, float], *, unit: str = "USD") -> list[Fact]:
+    """Calendar-2024 facts keyed by period label: Q1..Q4 (3 months), 6M, 9M, FY."""
+    periods = {
+        "Q1": ("2024-01-01", "2024-03-31", "10-Q", "2024-04-30", "0000000001-24-000001"),
+        "Q2": ("2024-04-01", "2024-06-30", "10-Q", "2024-07-30", "0000000001-24-000002"),
+        "6M": ("2024-01-01", "2024-06-30", "10-Q", "2024-07-30", "0000000001-24-000002"),
+        "Q3": ("2024-07-01", "2024-09-30", "10-Q", "2024-10-30", "0000000001-24-000003"),
+        "9M": ("2024-01-01", "2024-09-30", "10-Q", "2024-10-30", "0000000001-24-000003"),
+        "FY": ("2024-01-01", "2024-12-31", "10-K", "2025-02-15", "0000000001-25-000001"),
+    }
+    out = []
+    for label, value in values.items():
+        start, end, form, filed, accession = periods[label]
+        out.append(
+            fact(concept, start, end, value, form=form, filed=filed, accession=accession, unit=unit)
+        )
+    return out
+
+
+def _quarters(vals, metric):
+    return {v.fiscal_period: v for v in vals if v.metric == metric and v.fiscal_year == 2024}
+
+
+def test_q4_derived_as_fy_minus_9m_ytd():
+    facts = _cal_year("Revenues", {"Q1": 10, "Q2": 15, "6M": 25, "Q3": 20, "9M": 45, "FY": 70})
+    vals = xbrl.normalize(facts, cik="1", metrics=["revenue"], periods="quarterly", n=4)
+    q = _quarters(vals, "revenue")
+    assert [q[p].value for p in ("Q1", "Q2", "Q3", "Q4")] == [10, 15, 20, 25]
+    assert not q["Q1"].derived and not q["Q3"].derived
+    q4 = q["Q4"]
+    assert q4.derived is True
+    assert q4.period_start == date(2024, 10, 1) and q4.period_end == date(2024, 12, 31)
+    assert q4.note and "FY - 9M YTD" in q4.note
+    assert "0000000001-25-000001" in q4.note and "0000000001-24-000003" in q4.note
+    # The derived value points at the latest filing used (the 10-K).
+    assert q4.accession == "0000000001-25-000001" and q4.form == "10-K"
+
+
+def test_q4_falls_back_to_fy_minus_three_quarters():
+    facts = _cal_year("Revenues", {"Q1": 10, "Q2": 15, "Q3": 20, "FY": 70})
+    vals = xbrl.normalize(facts, cik="1", metrics=["revenue"], periods="quarterly", n=4)
+    q4 = _quarters(vals, "revenue")["Q4"]
+    assert q4.value == 25 and q4.derived
+    assert "FY - Q1 - Q2 - Q3" in q4.note
+
+
+def test_cash_flow_quarters_derived_from_ytd():
+    facts = _cal_year(
+        "NetCashProvidedByUsedInOperatingActivities",
+        {"Q1": 30, "6M": 54, "9M": 82, "FY": 111},
+    )
+    vals = xbrl.normalize(facts, cik="1", metrics=["operating_cash_flow"], periods="quarterly", n=4)
+    q = _quarters(vals, "operating_cash_flow")
+    assert [q[p].value for p in ("Q1", "Q2", "Q3", "Q4")] == [30, 24, 28, 29]
+    assert [q[p].derived for p in ("Q1", "Q2", "Q3", "Q4")] == [False, True, True, True]
+    assert "6M YTD - 3M" in q["Q2"].note
+    assert "9M YTD - 6M YTD" in q["Q3"].note
+    assert q["Q2"].period_start == date(2024, 4, 1)
+
+
+def test_direct_quarter_wins_over_derivation():
+    facts = _cal_year("Revenues", {"Q1": 10, "Q2": 16, "6M": 25, "FY": 70})  # Q2 direct
+    vals = xbrl.normalize(facts, cik="1", metrics=["revenue"], periods="quarterly", n=4)
+    q2 = _quarters(vals, "revenue")["Q2"]
+    assert q2.value == 16 and not q2.derived
+
+
+def test_per_share_and_share_count_q4_not_derived():
+    facts = _cal_year("Revenues", {"Q1": 10, "Q2": 15, "Q3": 20, "9M": 45, "FY": 70})
+    facts += _cal_year(
+        "EarningsPerShareDiluted", {"Q1": 1.0, "Q2": 1.5, "Q3": 2.0, "FY": 7.0}, unit="USD/shares"
+    )
+    vals = xbrl.normalize(facts, cik="1", metrics=["diluted_eps"], periods="quarterly", n=4)
+    q4 = _quarters(vals, "diluted_eps")["Q4"]
+    assert q4.value is None
+    assert "not additive" in q4.reason
+
+
+def test_annual_values_unaffected_by_derivation():
+    facts = _cal_year("Revenues", {"Q1": 10, "6M": 25, "9M": 45, "FY": 70})
+    vals = xbrl.normalize(facts, cik="1", metrics=["revenue"], periods="annual", n=4)
+    assert [(v.value, v.derived) for v in vals] == [(70, False)]
+
+
+# ---------------------------------------------------------------- splits (T9)
+
+
+def _split_case() -> list[Fact]:
+    """A 10:1 split between filings of 2024-05-01 (old basis) and 2024-08-01 (new basis)."""
+    old, new = "0000000001-24-000002", "0000000001-24-000003"
+    sh, eps = "shares", "USD/shares"
+    w = "WeightedAverageNumberOfDilutedSharesOutstanding"
+    e = "EarningsPerShareDiluted"
+    return [
+        # FY2022: first reported pre-split, later restated by the company on the new basis.
+        fact(w, "2022-01-01", "2022-12-31", 1000, filed="2023-02-01", unit=sh),
+        fact(w, "2022-01-01", "2022-12-31", 10000, filed="2025-02-01", accession=new, unit=sh),
+        fact(e, "2022-01-01", "2022-12-31", 3.0, filed="2023-02-01", unit=eps),
+        fact(e, "2022-01-01", "2022-12-31", 0.3, filed="2025-02-01", accession=new, unit=eps),
+        # Q1 2024: reported pre-split, restated in the next year's 10-Q.
+        fact(
+            w,
+            "2024-01-01",
+            "2024-03-31",
+            990,
+            filed="2024-05-01",
+            form="10-Q",
+            accession=old,
+            unit=sh,
+        ),
+        fact(
+            w,
+            "2024-01-01",
+            "2024-03-31",
+            9900,
+            filed="2024-08-01",
+            form="10-Q",
+            accession=new,
+            unit=sh,
+        ),
+        # FY2023: only ever reported pre-split (never restated).
+        fact(w, "2023-01-01", "2023-12-31", 1010, filed="2024-02-01", unit=sh),
+        fact(e, "2023-01-01", "2023-12-31", 2.5, filed="2024-02-01", unit=eps),
+        fact("NetIncomeLoss", "2023-01-01", "2023-12-31", 2525, filed="2024-02-01"),
+        fact("NetIncomeLoss", "2022-01-01", "2022-12-31", 3000, filed="2023-02-01"),
+    ]
+
+
+def test_detect_split_from_restated_share_counts():
+    (s,) = xbrl.detect_splits(_split_case())
+    assert s.ratio == 10
+    assert s.after == date(2024, 5, 1) and s.before == date(2024, 8, 1)
+    assert s.evidence >= 2
+
+
+def test_no_split_from_small_restatement_or_single_pair():
+    w = "WeightedAverageNumberOfDilutedSharesOutstanding"
+    facts = [
+        fact(w, "2022-01-01", "2022-12-31", 1000, filed="2023-02-01", unit="shares"),
+        fact(w, "2022-01-01", "2022-12-31", 1020, filed="2024-02-01", unit="shares"),
+        fact(w, "2021-01-01", "2021-12-31", 500, filed="2022-02-01", unit="shares"),
+        fact(w, "2021-01-01", "2021-12-31", 1000, filed="2024-02-01", unit="shares"),  # one pair
+    ]
+    assert xbrl.detect_splits(facts) == []
+
+
+def test_pre_split_values_adjusted_and_restated_values_kept():
+    vals = xbrl.normalize(_split_case(), cik="1", metrics=["shares_diluted", "diluted_eps"], n=2)
+    got = {(v.fiscal_year, v.metric): v for v in vals}
+    fy23_sh, fy23_eps = got[(2023, "shares_diluted")], got[(2023, "diluted_eps")]
+    assert fy23_sh.value == 10100 and fy23_sh.split_factor == 10
+    assert fy23_eps.value == 0.25 and fy23_eps.split_factor == 10
+    assert "split-adjusted" in fy23_sh.note and "10:1" in fy23_sh.note
+    # The company's own restated figures win over adjusting; no adjustment noted.
+    fy22 = got[(2022, "shares_diluted")]
+    assert fy22.value == 10000 and fy22.split_factor == 1 and fy22.note is None
+
+
+def test_explicit_splits_override_detection():
+    split = xbrl.SplitEvent(ratio=2, after=date(2024, 1, 1), before=date(2024, 3, 1), evidence=0)
+    vals = xbrl.normalize(_split_case(), cik="1", metrics=["diluted_eps"], n=1, splits=[split])
+    assert vals[0].value == 1.25 and vals[0].split_factor == 2
+
+
+async def test_nvda_splits_detected_from_companyfacts(sec):
+    res = await xbrl.get_fundamentals("NVDA", metrics=["shares_diluted"], n=1)
+    got = [(s.ratio, s.after, s.before) for s in res.splits]
+    assert [r for r, _, _ in got] == [4, 10]
+    # The real split dates (4:1 on 2021-07-20, 10:1 on 2024-06-10) lie in each window.
+    assert got[0][1] < date(2021, 7, 20) <= got[0][2]
+    assert got[1][1] < date(2024, 6, 10) <= got[1][2]
+
+
+def test_unit_scale_errors_are_not_splits():
+    # Filers sometimes tag a value in thousands, then fix it: a 1000x "restatement".
+    w = "WeightedAverageNumberOfDilutedSharesOutstanding"
+    facts = [
+        fact(w, f"{y}-01-01", f"{y}-12-31", v, filed=filed, unit="shares")
+        for y in (2020, 2021)
+        for v, filed in ((1_000, "2022-02-01"), (1_000_000, "2022-05-01"))
+    ]
+    assert xbrl.detect_splits(facts) == []
+
+
+async def test_aapl_splits_detected_without_scale_noise(sec):
+    res = await xbrl.get_fundamentals("AAPL", metrics=["shares_diluted"], n=1)
+    assert [s.ratio for s in res.splits] == [7, 4]  # 7:1 June 2014, 4:1 August 2020
+
+
+# ---------------------------------------------------------------- review fixes (PR #7)
+
+
+@pytest.mark.parametrize(
+    ("ratio", "label"), [(10, "10:1"), (1.5, "3:2"), (0.1, "1:10"), (0.2, "1:5"), (2 / 3, "2:3")]
+)
+def test_split_ratio_label_handles_reverse_splits(ratio, label):
+    assert xbrl._ratio_label(ratio) == label
+
+
+def test_phantom_combined_split_dropped():
+    # Two real 2:1 splits (2022, 2023). One series was reported only before the first and
+    # after the second, so its consecutive filings differ by 4: that is not a third split.
+    w = "WeightedAverageNumberOfDilutedSharesOutstanding"
+    sh = "shares"
+    facts = []
+    for y, (a, b, c) in {2019: (100, 200, 400), 2020: (110, 220, 440)}.items():
+        facts += [
+            fact(w, f"{y}-01-01", f"{y}-12-31", a, filed="2022-02-01", unit=sh),
+            fact(w, f"{y}-01-01", f"{y}-12-31", b, filed="2022-08-01", unit=sh),
+            fact(w, f"{y}-01-01", f"{y}-12-31", c, filed="2023-08-01", unit=sh),
+        ]
+    for q in ("01", "04"):
+        facts += [
+            fact(w, f"2018-{q}-01", f"2018-{q}-28", 50, filed="2021-11-01", unit=sh),
+            fact(w, f"2018-{q}-01", f"2018-{q}-28", 200, filed="2024-02-01", unit=sh),
+        ]
+    assert [s.ratio for s in xbrl.detect_splits(facts)] == [2, 2]
+
+
+def test_reported_quarter_under_later_tag_beats_derived():
+    facts = _cal_year("Revenues", {"Q1": 10, "6M": 25, "FY": 70})
+    facts += [
+        fact(
+            "RevenueFromContractWithCustomerExcludingAssessedTax",
+            "2024-04-01",
+            "2024-06-30",
+            14,
+            form="10-Q",
+            filed="2024-07-30",
+        )
+    ]
+    vals = xbrl.normalize(facts, cik="1", metrics=["revenue"], periods="quarterly", n=4)
+    q2 = _quarters(vals, "revenue")["Q2"]
+    assert q2.value == 14 and not q2.derived
+    assert q2.tag == "RevenueFromContractWithCustomerExcludingAssessedTax"
+
+
+def test_implausible_derived_revenue_is_null_with_reason():
+    # FY recast lower in the 10-K (e.g. discontinued operations) than the 10-Q 9M YTD.
+    facts = _cal_year("Revenues", {"Q1": 10, "Q2": 15, "Q3": 20, "9M": 45, "FY": 30})
+    vals = xbrl.normalize(facts, cik="1", metrics=["revenue"], periods="quarterly", n=4)
+    q4 = _quarters(vals, "revenue")["Q4"]
+    assert q4.value is None and q4.derived
+    assert "implausible" in q4.reason and "FY - 9M YTD" in q4.reason
+
+
+def test_negative_derived_net_income_is_kept():
+    facts = _cal_year("NetIncomeLoss", {"Q1": 10, "Q2": 15, "Q3": 20, "9M": 45, "FY": 30})
+    vals = xbrl.normalize(facts, cik="1", metrics=["net_income"], periods="quarterly", n=4)
+    assert _quarters(vals, "net_income")["Q4"].value == -15
+
+
+async def test_quarterly_notes_do_not_claim_ytd_excluded(sec):
+    res = await xbrl.get_fundamentals("MSFT", metrics=["revenue"], periods="quarterly", n=1)
+    assert not any("year-to-date 10-Q facts are excluded" in n for n in res.notes)

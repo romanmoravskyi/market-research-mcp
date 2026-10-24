@@ -19,6 +19,7 @@ from market_research_mcp.sources import (
     health,
     insiders,
     prices,
+    ratios,
     xbrl,
 )
 
@@ -32,6 +33,7 @@ SOURCE_MODULES = [
     edgar_docs,
     insiders,
     xbrl,
+    ratios,
     calendar,
     prompts,
 ]
