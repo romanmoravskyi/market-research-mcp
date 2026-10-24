@@ -1,0 +1,15 @@
+{
+  "name": "market-research-mcp",
+  "description": "Read-only market research tooling for Claude Code: SEC EDGAR, FRED and price data with sourced research briefs.",
+  "owner": {
+    "name": "market-research-mcp contributors"
+  },
+  "plugins": [
+    {
+      "name": "market-research",
+      "source": "./",
+      "description": "MCP server for SEC EDGAR, FRED and prices, plus the analyze-ticker skill. Read-only, not financial advice.",
+      "category": "research"
+    }
+  ]
+}

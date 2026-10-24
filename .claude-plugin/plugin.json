@@ -1,0 +1,25 @@
+{
+  "name": "market-research",
+  "displayName": "Market Research",
+  "version": "0.1.0",
+  "description": "Read-only market data (SEC EDGAR, FRED, prices) as an MCP server, plus the analyze-ticker skill for sourced one-page research briefs. Not financial advice.",
+  "author": {
+    "name": "market-research-mcp contributors"
+  },
+  "license": "MIT",
+  "keywords": ["mcp", "sec", "edgar", "fred", "research", "read-only"],
+  "mcpServers": {
+    "market-research": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--quiet",
+        "--no-dev",
+        "--frozen",
+        "--project",
+        "${CLAUDE_PLUGIN_ROOT}",
+        "market-research-mcp"
+      ]
+    }
+  }
+}
