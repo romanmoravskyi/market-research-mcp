@@ -19,6 +19,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date, timedelta
+from fractions import Fraction
 from typing import Any, Literal
 
 from mcp.server.fastmcp import FastMCP
@@ -48,6 +49,8 @@ __all__ = [
     "select_annual",
     "select_instant",
     "select_quarterly",
+    "SplitEvent",
+    "detect_splits",
 ]
 
 SOURCE = "SEC EDGAR XBRL companyfacts"
@@ -160,7 +163,11 @@ NOTES = [
     "total_debt = LongTermDebtNoncurrent + DebtCurrent (or + LongTermDebtCurrent), else "
     "LongTermDebt; leases excluded. shares_outstanding is the cover-page count, dated after "
     "the period end.",
-    "Values are as reported in USD (EPS in USD/shares); share counts are not split-adjusted.",
+    "Values are as reported in USD (EPS in USD/shares). Share counts and per-share values are "
+    "split-adjusted: the company's own restated figures are preferred; values filed only "
+    "before a split are multiplied (shares) or divided (per share) by the split ratio "
+    "(split_factor, with a note). Splits are detected from SEC facts restated by a clean "
+    "ratio between consecutive filings.",
 ]
 
 
@@ -398,6 +405,112 @@ def _add_year(d: date, years: int = 1) -> date:
         return d.replace(year=d.year + years, day=28)
 
 
+# ---------------------------------------------------------------- splits
+
+SPLIT_MIN_RATIO = 1.2  # smaller changes are ordinary restatements, not splits
+SPLIT_MAX_RATIO = 500  # 1000x and up are unit-scale fixes (thousands vs units), not splits
+SPLIT_TOLERANCE = 0.005
+SPLIT_MIN_EVIDENCE = 2  # restated (period, concept) pairs needed to accept a split
+SPLIT_UNITS = frozenset({"shares"})
+PER_SHARE_UNIT = "USD/shares"
+
+
+class SplitEvent(BaseModel):
+    """A stock split. `ratio` = new shares per old share (10 for 10:1, 0.1 for 1:10).
+
+    The split took effect after the filing dated `after` and on or before the filing dated
+    `before`. Facts filed before `before` are on the old basis.
+    """
+
+    ratio: float
+    after: date
+    before: date
+    evidence: int
+
+
+def _snap_ratio(r: float) -> float | None:
+    if r <= 0:
+        return None
+    big = max(r, 1 / r)
+    if not SPLIT_MIN_RATIO <= big <= SPLIT_MAX_RATIO:
+        return None
+    frac = Fraction(big).limit_denominator(4)
+    if frac == 0 or abs(big - float(frac)) / float(frac) > SPLIT_TOLERANCE:
+        return None
+    ratio = float(frac)
+    return ratio if r >= 1 else 1 / ratio
+
+
+def detect_splits(facts: Iterable[Fact]) -> list[SplitEvent]:
+    """Stock splits implied by share-count facts restated between consecutive filings.
+
+    For every (concept, period) reported in more than one 10-K/10-Q, consecutive filings
+    whose values differ by a clean ratio (2, 3:2, 10, 1:10, ...) mark a split between those
+    filing dates. Pairs with the same ratio and overlapping windows are merged; a split
+    needs at least SPLIT_MIN_EVIDENCE pairs. Oldest first.
+    """
+    series: dict[tuple[str, str, date | None, date], list[Fact]] = {}
+    for f in facts:
+        if f.unit in SPLIT_UNITS and f.form.upper() in PERIODIC_FORMS and f.value:
+            series.setdefault((f.concept, f.unit, f.start, f.end), []).append(f)
+    pairs: list[tuple[float, date, date]] = []
+    for rows in series.values():
+        by_filed: dict[date, Fact] = {}
+        for f in rows:
+            by_filed.setdefault(f.filed, f)
+        ordered = [by_filed[d] for d in sorted(by_filed)]
+        for old, new in zip(ordered, ordered[1:], strict=False):
+            ratio = _snap_ratio(new.value / old.value)
+            if ratio is not None:
+                pairs.append((ratio, old.filed, new.filed))
+    clusters: list[list[Any]] = []  # [ratio, after, before, evidence]
+    for ratio, old_filed, new_filed in sorted(pairs, key=lambda p: (p[0], p[2], p[1])):
+        for c in clusters:
+            lo, hi = max(c[1], old_filed), min(c[2], new_filed)
+            if c[0] == ratio and lo < hi:
+                c[1], c[2], c[3] = lo, hi, c[3] + 1
+                break
+        else:
+            clusters.append([ratio, old_filed, new_filed, 1])
+    events = [
+        SplitEvent(ratio=r, after=a, before=b, evidence=e)
+        for r, a, b, e in clusters
+        if e >= SPLIT_MIN_EVIDENCE
+    ]
+    return sorted(events, key=lambda s: s.before)
+
+
+def _ratio_label(ratio: float) -> str:
+    frac = Fraction(ratio).limit_denominator(4)
+    return f"{frac.numerator}:{frac.denominator}"
+
+
+def _split_adjust(v: FundamentalValue, splits: list[SplitEvent]) -> FundamentalValue:
+    """Put a share count or per-share value filed before a split on the current basis."""
+    if v.value is None or v.filed is None or v.unit not in SPLIT_UNITS | {PER_SHARE_UNIT}:
+        return v
+    applied = [s for s in splits if v.filed < s.before]
+    if not applied:
+        return v
+    factor = 1.0
+    for s in applied:
+        factor *= s.ratio
+    if v.unit == PER_SHARE_UNIT:
+        v.value = round(v.value / factor, 6)
+    else:
+        v.value = round(v.value * factor)
+    v.split_factor = factor
+    what = "; ".join(
+        f"{_ratio_label(s.ratio)} split detected from SEC restatements between filings of "
+        f"{s.after} and {s.before}"
+        for s in applied
+    )
+    op = "divided" if v.unit == PER_SHARE_UNIT else "multiplied"
+    note = f"split-adjusted: value filed {v.filed} {op} by {factor:g} ({what})"
+    v.note = f"{v.note}; {note}" if v.note else note
+    return v
+
+
 # ---------------------------------------------------------------- output models
 
 
@@ -414,6 +527,7 @@ class FundamentalValue(BaseModel):
     accession: str | None = None
     filed: date | None = None
     derived: bool = False
+    split_factor: float = 1.0
     note: str | None = None
     source_url: str | None = None
     reason: str | None = None
@@ -426,6 +540,7 @@ class Fundamentals(Sourced):
     periods: Periods
     metrics: list[str]
     values: list[FundamentalValue]
+    splits: list[SplitEvent] = []
 
 
 # ---------------------------------------------------------------- normalization
@@ -466,14 +581,20 @@ def normalize(
     metrics: list[str] | None = None,
     periods: Periods = "annual",
     n: int = 5,
+    splits: list[SplitEvent] | None = None,
 ) -> list[FundamentalValue]:
     """Map facts to canonical metrics for the newest `n` periods (newest first).
+
+    Share counts and per-share values filed before a split are adjusted to the current
+    basis; `splits` defaults to `detect_splits(facts)`.
 
     Fallback tags are tried per period: the first tag with a value for that period wins.
     Metrics with no matching tag at all, or no value for a period, return value None with a
     reason. Nothing is estimated or filled in.
     """
     names = metrics or list(METRICS)
+    if splits is None:
+        splits = detect_splits(facts)
     present = {(f.concept, f.unit) for f in facts}
     flows = duration_facts(facts, periods)
     anchors = _anchor_tags()
@@ -529,7 +650,7 @@ def normalize(
                 additive = spec.kind != "duration" or spec.unit == "USD"
                 null.reason = NO_VALUE if additive or end in reported_ends else NOT_ADDITIVE
                 found = null
-            out.append(found)
+            out.append(_split_adjust(found, splits))
     return out
 
 
@@ -605,7 +726,8 @@ async def get_fundamentals(
     facts = parse_facts(res.data)
     if not facts:
         raise NotFound(f"XBRL facts for {company.ticker}", SOURCE)
-    values = normalize(facts, cik=company.cik, metrics=names, periods=periods, n=n)
+    splits = detect_splits(facts)
+    values = normalize(facts, cik=company.cik, metrics=names, periods=periods, n=n, splits=splits)
     filed = [v.filed for v in values if v.filed is not None]
     notes = list(NOTES)
     if periods == "quarterly":
@@ -628,6 +750,7 @@ async def get_fundamentals(
         periods=periods,
         metrics=names,
         values=values,
+        splits=splits,
     )
 
 

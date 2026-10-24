@@ -16,7 +16,14 @@ from market_research_mcp.sources import edgar, xbrl
 from market_research_mcp.sources.xbrl import Fact
 
 SEC = Path(__file__).parent / "fixtures" / "sec"
-CIKS = {"MSFT": "789019", "JPM": "19617", "O": "726728", "NVDA": "1045810"}
+CIKS = {
+    "MSFT": "789019",
+    "JPM": "19617",
+    "O": "726728",
+    "NVDA": "1045810",
+    "AAPL": "320193",
+    "BRK-B": "1067983",
+}
 
 
 def load_tickers() -> dict:
@@ -349,3 +356,108 @@ def test_annual_values_unaffected_by_derivation():
     facts = _cal_year("Revenues", {"Q1": 10, "6M": 25, "9M": 45, "FY": 70})
     vals = xbrl.normalize(facts, cik="1", metrics=["revenue"], periods="annual", n=4)
     assert [(v.value, v.derived) for v in vals] == [(70, False)]
+
+
+# ---------------------------------------------------------------- splits (T9)
+
+
+def _split_case() -> list[Fact]:
+    """A 10:1 split between filings of 2024-05-01 (old basis) and 2024-08-01 (new basis)."""
+    old, new = "0000000001-24-000002", "0000000001-24-000003"
+    sh, eps = "shares", "USD/shares"
+    w = "WeightedAverageNumberOfDilutedSharesOutstanding"
+    e = "EarningsPerShareDiluted"
+    return [
+        # FY2022: first reported pre-split, later restated by the company on the new basis.
+        fact(w, "2022-01-01", "2022-12-31", 1000, filed="2023-02-01", unit=sh),
+        fact(w, "2022-01-01", "2022-12-31", 10000, filed="2025-02-01", accession=new, unit=sh),
+        fact(e, "2022-01-01", "2022-12-31", 3.0, filed="2023-02-01", unit=eps),
+        fact(e, "2022-01-01", "2022-12-31", 0.3, filed="2025-02-01", accession=new, unit=eps),
+        # Q1 2024: reported pre-split, restated in the next year's 10-Q.
+        fact(
+            w,
+            "2024-01-01",
+            "2024-03-31",
+            990,
+            filed="2024-05-01",
+            form="10-Q",
+            accession=old,
+            unit=sh,
+        ),
+        fact(
+            w,
+            "2024-01-01",
+            "2024-03-31",
+            9900,
+            filed="2024-08-01",
+            form="10-Q",
+            accession=new,
+            unit=sh,
+        ),
+        # FY2023: only ever reported pre-split (never restated).
+        fact(w, "2023-01-01", "2023-12-31", 1010, filed="2024-02-01", unit=sh),
+        fact(e, "2023-01-01", "2023-12-31", 2.5, filed="2024-02-01", unit=eps),
+        fact("NetIncomeLoss", "2023-01-01", "2023-12-31", 2525, filed="2024-02-01"),
+        fact("NetIncomeLoss", "2022-01-01", "2022-12-31", 3000, filed="2023-02-01"),
+    ]
+
+
+def test_detect_split_from_restated_share_counts():
+    (s,) = xbrl.detect_splits(_split_case())
+    assert s.ratio == 10
+    assert s.after == date(2024, 5, 1) and s.before == date(2024, 8, 1)
+    assert s.evidence >= 2
+
+
+def test_no_split_from_small_restatement_or_single_pair():
+    w = "WeightedAverageNumberOfDilutedSharesOutstanding"
+    facts = [
+        fact(w, "2022-01-01", "2022-12-31", 1000, filed="2023-02-01", unit="shares"),
+        fact(w, "2022-01-01", "2022-12-31", 1020, filed="2024-02-01", unit="shares"),
+        fact(w, "2021-01-01", "2021-12-31", 500, filed="2022-02-01", unit="shares"),
+        fact(w, "2021-01-01", "2021-12-31", 1000, filed="2024-02-01", unit="shares"),  # one pair
+    ]
+    assert xbrl.detect_splits(facts) == []
+
+
+def test_pre_split_values_adjusted_and_restated_values_kept():
+    vals = xbrl.normalize(_split_case(), cik="1", metrics=["shares_diluted", "diluted_eps"], n=2)
+    got = {(v.fiscal_year, v.metric): v for v in vals}
+    fy23_sh, fy23_eps = got[(2023, "shares_diluted")], got[(2023, "diluted_eps")]
+    assert fy23_sh.value == 10100 and fy23_sh.split_factor == 10
+    assert fy23_eps.value == 0.25 and fy23_eps.split_factor == 10
+    assert "split-adjusted" in fy23_sh.note and "10:1" in fy23_sh.note
+    # The company's own restated figures win over adjusting; no adjustment noted.
+    fy22 = got[(2022, "shares_diluted")]
+    assert fy22.value == 10000 and fy22.split_factor == 1 and fy22.note is None
+
+
+def test_explicit_splits_override_detection():
+    split = xbrl.SplitEvent(ratio=2, after=date(2024, 1, 1), before=date(2024, 3, 1), evidence=0)
+    vals = xbrl.normalize(_split_case(), cik="1", metrics=["diluted_eps"], n=1, splits=[split])
+    assert vals[0].value == 1.25 and vals[0].split_factor == 2
+
+
+async def test_nvda_splits_detected_from_companyfacts(sec):
+    res = await xbrl.get_fundamentals("NVDA", metrics=["shares_diluted"], n=1)
+    got = [(s.ratio, s.after, s.before) for s in res.splits]
+    assert [r for r, _, _ in got] == [4, 10]
+    # The real split dates (4:1 on 2021-07-20, 10:1 on 2024-06-10) lie in each window.
+    assert got[0][1] < date(2021, 7, 20) <= got[0][2]
+    assert got[1][1] < date(2024, 6, 10) <= got[1][2]
+
+
+def test_unit_scale_errors_are_not_splits():
+    # Filers sometimes tag a value in thousands, then fix it: a 1000x "restatement".
+    w = "WeightedAverageNumberOfDilutedSharesOutstanding"
+    facts = [
+        fact(w, f"{y}-01-01", f"{y}-12-31", v, filed=filed, unit="shares")
+        for y in (2020, 2021)
+        for v, filed in ((1_000, "2022-02-01"), (1_000_000, "2022-05-01"))
+    ]
+    assert xbrl.detect_splits(facts) == []
+
+
+async def test_aapl_splits_detected_without_scale_noise(sec):
+    res = await xbrl.get_fundamentals("AAPL", metrics=["shares_diluted"], n=1)
+    assert [s.ratio for s in res.splits] == [7, 4]  # 7:1 June 2014, 4:1 August 2020
