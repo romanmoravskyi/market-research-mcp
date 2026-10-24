@@ -24,6 +24,8 @@ from pathlib import Path
 
 import httpx
 
+from market_research_mcp.sources import edgar
+
 ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "tests" / "fixtures" / "sec"
 
@@ -39,10 +41,7 @@ COMPANYFACTS = {
 }
 # EDGAR company browse Atom feeds: (CIK, form type)
 ATOM_FEEDS = [(19617, "10-K")]
-ATOM_URL = (
-    "https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik:010d}&type={form}"
-    "&dateb=&owner=include&count=40&output=atom"
-)
+ATOM_MAX_PAGES = 3  # feed pages (of edgar.ATOM_COUNT entries) to keep per feed
 MIN_INTERVAL = 0.1  # 10 requests per second
 MAX_OLDER_PAGES = 1  # older submissions pages to keep per company
 
@@ -77,16 +76,22 @@ def write_json_gz(path: Path, raw: bytes) -> None:
     path.with_name(path.name + ".gz").write_bytes(gzip.compress(text.encode("utf-8"), mtime=0))
 
 
-def atom_fixture_name(cik: int, form: str) -> str:
-    return f"atom-CIK{cik:010d}-{form.replace('/', '_')}.xml.gz"
+def atom_fixture_name(cik: int, form: str, start: int = 0) -> str:
+    suffix = f"-start{start}" if start else ""
+    return f"atom-CIK{cik:010d}-{form.replace('/', '_')}{suffix}.xml.gz"
 
 
 def record_atom_feeds(client: Client) -> None:
-    """Record EDGAR browse Atom feeds raw (validated as XML), gzip-compressed."""
+    """Record EDGAR browse Atom feed pages raw (validated as XML), gzip-compressed, until a
+    short page (the end of the feed) or ATOM_MAX_PAGES."""
     for cik, form in ATOM_FEEDS:
-        raw = client.get(ATOM_URL.format(cik=cik, form=form))
-        ET.fromstring(raw)  # validate before writing
-        (OUT / atom_fixture_name(cik, form)).write_bytes(gzip.compress(raw, mtime=0))
+        for page in range(ATOM_MAX_PAGES):
+            start = page * edgar.ATOM_COUNT
+            raw = client.get(edgar.atom_feed_url(cik, form, start))
+            root = ET.fromstring(raw)  # validate before writing
+            (OUT / atom_fixture_name(cik, form, start)).write_bytes(gzip.compress(raw, mtime=0))
+            if len(root.findall("{http://www.w3.org/2005/Atom}entry")) < edgar.ATOM_COUNT:
+                break
 
 
 def main() -> int:

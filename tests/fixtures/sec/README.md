@@ -10,7 +10,8 @@ Every file is gzip-compressed (`*.json.gz`, `*.xml.gz`) to keep the repo small.
 - `CIK##########-submissions-001.json.gz`: the first older page listed in `filings.files`
 - `atom-CIK0000019617-10-K.xml.gz`: the EDGAR company browse Atom feed of JPM 10-K filings,
   `https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=0000019617&type=10-K&dateb=&owner=include&count=40&output=atom`
-  (raw XML, recorded 2026-10-25; `--atom-only` re-records just this feed)
+  (raw XML, recorded 2026-10-25; `--atom-only` re-records just this feed), and
+  `atom-CIK0000019617-10-K-start40.xml.gz`, its second (last, short) page with `&start=40`
 - `companyfacts/CIK##########.json.gz`: `https://data.sec.gov/api/xbrl/companyfacts/CIK##########.json`
 
 Tests read them with `load_sec_fixture(name)` from `tests/conftest.py`, which accepts the name

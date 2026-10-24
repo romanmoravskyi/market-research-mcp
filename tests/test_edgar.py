@@ -1,7 +1,8 @@
 import gzip
 import os
 import re
-from datetime import date
+from datetime import UTC, date, datetime
+from pathlib import Path
 
 import httpx
 import pytest
@@ -53,9 +54,10 @@ def sec(ua):
             routes[name.removesuffix(".json")] = mock.get(SUB + name).mock(
                 return_value=httpx.Response(200, json=load_sec_fixture(path.name))
             )
-        # EDGAR company browse Atom feed: empty by default; tests swap in recorded feeds.
+        # EDGAR company browse Atom feed: unusable by default (keeps the pre-feed behaviour);
+        # tests swap in recorded feeds.
         routes["atom"] = mock.get(host="www.sec.gov", path="/cgi-bin/browse-edgar").mock(
-            return_value=httpx.Response(200, content=EMPTY_ATOM)
+            return_value=httpx.Response(200, content=b"<html>no feed</html>")
         )
         routes["_router"] = mock
         yield routes
@@ -364,13 +366,24 @@ async def test_nonsense_name_not_found(sec):
 
 # ---------------------------------------------------------------- F3 Atom feed fallback
 
-JPM_ATOM = "atom-CIK0000019617-10-K.xml.gz"
+JPM_ATOM = "atom-CIK0000019617-10-K.xml.gz"  # start=0 (40 entries)
+JPM_ATOM_P2 = "atom-CIK0000019617-10-K-start40.xml.gz"  # start=40 (3 entries, last page)
+
+
+def _atom_raw(name: str) -> bytes:
+    return gzip.decompress((FIXTURES / name).read_bytes())
 
 
 def _jpm_atom(sec):
-    """Serve the recorded JPM 10-K Atom feed; pages 002+ are empty so paging hits the cap."""
-    raw = gzip.decompress((FIXTURES / JPM_ATOM).read_bytes())
-    sec["atom"].mock(return_value=httpx.Response(200, content=raw))
+    """Serve the recorded JPM 10-K Atom feed pages by `start`; submissions pages 002+ are
+    empty so paging hits the cap."""
+    pages = {"0": _atom_raw(JPM_ATOM), "40": _atom_raw(JPM_ATOM_P2)}
+
+    def respond(request):
+        start = request.url.params.get("start", "0")
+        return httpx.Response(200, content=pages.get(start, EMPTY_ATOM))
+
+    sec["atom"].mock(side_effect=respond)
     for n in range(2, 30):
         sec["_router"].get(_jpm_page(n)).mock(return_value=httpx.Response(200, json=_empty_block()))
     return sec["atom"]
@@ -416,8 +429,8 @@ async def test_atom_fallback_exact_form_semantics(sec):
     r = await edgar.list_filings("JPM", forms=["10-K"], limit=50)
     assert all(f.form == "10-K" for f in r.items)
     accs = [f.accession for f in r.items]
-    assert len(accs) == len(set(accs)) == 26
-    assert accs[-1] == "0000950123-97-002412"
+    assert len(accs) == len(set(accs)) == 26 + EXACT_10K_P2
+    assert accs[-1] == "0000950123-94-000607"
     keys = [(f.filing_date, f.accession) for f in r.items]
     assert keys == sorted(keys, reverse=True)
 
@@ -459,3 +472,99 @@ async def test_atom_feed_failure_keeps_capped_note(sec):
     r = await edgar.list_filings("JPM", forms=["10-K"], limit=3)
     assert len(r.items) == 1 and r.truncated
     assert any("older" in n for n in r.notes)
+
+
+# ---------------------------------------------------------------- PR #5 review fixes
+
+EXACT_10K_P2 = 1  # 10-K entries (not 10-K/A or 10-K405) in the recorded start=40 page
+
+
+async def test_review_capped_kept_when_one_form_feed_fails(sec):
+    # Finding 1: the 10-Q feed fails; 26 old 10-Ks must not clear the "older may exist" flag.
+    _jpm_atom(sec)
+    p1 = _atom_raw(JPM_ATOM)
+
+    def respond(request):
+        if request.url.params["type"] == "10-Q":
+            return httpx.Response(200, content=b"<html>maintenance</html>")
+        return httpx.Response(200, content=p1)
+
+    sec["atom"].mock(side_effect=respond)
+    r = await edgar.list_filings("JPM", forms=["10-K", "10-Q"], limit=10)
+    assert r.truncated
+    assert any("older matching filings may exist" in n for n in r.notes)
+
+
+async def test_review_stale_feed_marks_result_stale(sec, monkeypatch):
+    # Finding 2: a feed served stale from cache after 429s marks the list stale and dated.
+    _jpm_atom(sec)
+
+    async def no_sleep(_):
+        return None
+
+    monkeypatch.setattr(http, "_sleep", no_sleep)
+    old = datetime(2026, 1, 2, 3, 4, tzinfo=UTC)
+    cache_mod.get_cache().set(
+        "submissions", "atom-CIK0000019617-10-K-0", _atom_raw(JPM_ATOM), 60, now=old
+    )
+    sec["atom"].mock(return_value=httpx.Response(429))
+    r = await edgar.list_filings("JPM", forms=["10-K"], limit=3)
+    assert len(r.items) == 3
+    assert r.stale
+    assert any("browse-edgar" in n and "2026-01-02" in n for n in r.notes)
+
+
+async def test_review_non_feed_response_not_cached(sec):
+    # Finding 3: an HTML 200 page must not disable the fallback for the cache TTL.
+    atom = _jpm_atom(sec)
+    good = atom.side_effect
+    atom.mock(side_effect=None, return_value=httpx.Response(200, content=b"<html>busy</html>"))
+    first = await edgar.list_filings("JPM", forms=["10-K"], limit=3)
+    assert len(first.items) == 1
+    atom.mock(return_value=None, side_effect=good)
+    second = await edgar.list_filings("JPM", forms=["10-K"], limit=3)
+    assert len(second.items) == 3
+    assert atom.call_count == 2
+
+
+async def test_review_complete_feed_not_truncated(sec):
+    # Findings 4 and 5: the feed is paged with `start=` past prefix-only entries, and a
+    # short last page means the full history was seen: no truncation, no "older" note.
+    atom = _jpm_atom(sec)
+    r = await edgar.list_filings("JPM", forms=["10-K"], limit=50)
+    assert len(r.items) == 26 + EXACT_10K_P2
+    assert not r.truncated
+    assert not any("older matching filings may exist" in n for n in r.notes)
+    starts = [c.request.url.params.get("start", "0") for c in atom.calls]
+    assert starts == ["0", "40"]
+
+
+async def test_review_no_feed_when_pages_exhausted(sec):
+    # Finding 9: all submission pages read without hitting the cap: the history is complete.
+    block = _empty_block()
+    block["accessionNumber"].append("0000320193-25-000001")
+    block["filingDate"].append("2025-11-01")
+    block["reportDate"].append("2025-09-27")
+    block["form"].append("10-K")
+    block["primaryDocument"].append("aapl-10k.htm")
+    block["items"].append("")
+    sec["_router"].get(SUB + "CIK0000320193.json").mock(
+        return_value=httpx.Response(
+            200, json={"name": "Apple Inc.", "filings": {"recent": block, "files": []}}
+        )
+    )
+    r = await edgar.list_filings("AAPL", forms=["10-K"], limit=3)
+    assert len(r.items) == 1 and not r.truncated
+    assert not sec["atom"].called
+
+
+def test_review_recorder_uses_production_feed_url():
+    # Finding 10: the recorder builds feed URLs with edgar.atom_feed_url.
+    import importlib.util
+
+    path = Path(__file__).parent.parent / "scripts" / "record_sec_fixtures.py"
+    spec = importlib.util.spec_from_file_location("record_sec_fixtures", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert not hasattr(mod, "ATOM_URL")
+    assert mod.edgar.atom_feed_url is edgar.atom_feed_url
