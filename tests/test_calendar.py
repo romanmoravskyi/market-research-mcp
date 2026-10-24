@@ -222,3 +222,21 @@ async def test_live_finnhub_msft(monkeypatch):
     row = res.rows[0]
     assert row.method in {"finnhub", "edgar_estimate"}
     assert row.source and row.source_url
+
+
+@pytest.mark.parametrize("query", ["BRK/B", "brk.b", " BRK-B "])
+async def test_share_class_ticker_uses_shared_normalization_and_finnhub_symbol(mock, query):
+    body = load_json("finnhub", "msft_earnings")
+    for item in body["earningsCalendar"]:
+        item["symbol"] = "BRK.B"
+    route = finnhub_route(mock, body=body)
+    res = await calendar.get_earnings_calendar([query, "BRK-B"], days_ahead=30)
+    assert [r.ticker for r in res.rows] == ["BRK-B"]
+    assert res.rows[0].method == "finnhub"
+    assert route.calls.last.request.url.params["symbol"] == "BRK.B"
+
+
+@pytest.mark.parametrize("bad", ["MS FT", "MSFT!", "$AAPL"])
+async def test_invalid_ticker_chars_are_bad_input(bad):
+    with pytest.raises(BadInput):
+        await calendar.get_earnings_calendar([bad])

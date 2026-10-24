@@ -170,6 +170,7 @@ class FilingIndex:
     filing_date: date | None
     documents: list[IndexDoc]
     url: str
+    filer_ciks: frozenset[str] = frozenset()  # 10-digit CIKs listed as filers on the index
 
 
 # ---------------------------------------------------------------- helpers
@@ -280,26 +281,47 @@ def _parse_index(html: bytes, url: str) -> FilingIndex:
         )
     if not form and docs:
         form = docs[0].type
-    return FilingIndex(form=form, filing_date=filing_date, documents=docs, url=url)
+    filers: set[str] = set()
+    for a in soup.select('a[href*="browse-edgar"]'):
+        m = re.search(r"CIK=(\d+)", str(a.get("href", "")), re.IGNORECASE)
+        if m:
+            filers.add(m.group(1).zfill(10))
+    return FilingIndex(
+        form=form, filing_date=filing_date, documents=docs, url=url, filer_ciks=frozenset(filers)
+    )
 
 
-async def _get_index(cik: str, accession: str) -> FilingIndex:
+async def _get_index(cik: str, accession: str, ticker: str) -> FilingIndex:
+    """The filing index, keyed by CIK + accession; BadInput if the filing is not this company's."""
     url = f"{_folder_url(cik, accession)}{accession}-index.htm"
-    res = await http.fetch("edgar", url, cache_ns=NS, cache_key=f"{accession}|index", parse="bytes")
-    return _parse_index(res.data, url)
+    res = await http.fetch(
+        "edgar", url, cache_ns=NS, cache_key=f"{cik}|{accession}|index", parse="bytes"
+    )
+    index = _parse_index(res.data, url)
+    if index.filer_ciks and cik not in index.filer_ciks:
+        raise BadInput(
+            f"filing {accession} does not belong to {ticker} (CIK {cik}); "
+            "get accession numbers for this company from list_filings."
+        )
+    return index
+
+
+# A section set missing the requested item may be a parser miss: keep it only briefly.
+PARTIAL_TTL_SECONDS = 24 * 3600
 
 
 async def _cache_get(key: str) -> tuple[str, datetime] | None:
     hit = await asyncio.to_thread(cache_mod.get_cache().get, NS, key)
-    if hit is None:
+    if hit is None or hit.expired:
         return None
     value = hit.value if isinstance(hit.value, str) else hit.value.decode("utf-8")
     return value, hit.fetched_at
 
 
-async def _cache_set(key: str, value: str) -> datetime:
+async def _cache_set(key: str, value: str, ttl: int | None | str = "default") -> datetime:
     now = utcnow()
-    await asyncio.to_thread(cache_mod.get_cache().set, NS, key, value, cache_mod.ttl_for(NS), now)
+    seconds = cache_mod.ttl_for(NS) if ttl == "default" else ttl
+    await asyncio.to_thread(cache_mod.get_cache().set, NS, key, value, seconds, now)
     return now
 
 
@@ -404,7 +426,7 @@ async def get_filing_section(
     _resolve_section(section, None)  # reject unknown names before any network call
     acc = normalize_accession(accession)
     company = await get_company(ticker)
-    index = await _get_index(company.cik, acc)
+    index = await _get_index(company.cik, acc, company.ticker)
     form = _base_form(index.form)
     if form is None:
         raise BadInput(
@@ -422,7 +444,7 @@ async def get_filing_section(
         raise NotFound(f"primary document in filing {acc}", SOURCE)
     doc_url = _folder_url(company.cik, acc) + primary.filename
 
-    cache_key = f"{acc}|sections"
+    cache_key = f"{company.cik}|{acc}|sections"
     cached = await _cache_get(cache_key)
     if cached is not None:
         sections: dict[str, str] = json.loads(cached[0])
@@ -431,7 +453,11 @@ async def get_filing_section(
         _set_edgartools_identity()
         res = await http.fetch("edgar", doc_url, parse="bytes")
         sections = await asyncio.to_thread(_extract_sections, _decode(res.data), form)
-        retrieved_at = await _cache_set(cache_key, json.dumps(sections))
+        retrieved_at = utcnow()
+        if sections:  # an empty extraction is a parser failure: never cache it
+            partial = not sections.get(key, "").strip()
+            ttl = PARTIAL_TTL_SECONDS if partial else "default"
+            retrieved_at = await _cache_set(cache_key, json.dumps(sections), ttl)
 
     text = sections.get(key, "")
     if not text.strip():
@@ -471,7 +497,7 @@ async def get_filing_exhibit(
     wanted = _normalize_exhibit(exhibit)
     acc = normalize_accession(accession)
     company = await get_company(ticker)
-    index = await _get_index(company.cik, acc)
+    index = await _get_index(company.cik, acc, company.ticker)
     doc = next((d for d in index.documents if d.type.upper() == wanted), None)
     if doc is None:
         present = sorted({d.type for d in index.documents if d.type.upper().startswith("EX-")})
@@ -484,7 +510,7 @@ async def get_filing_exhibit(
     if ext not in ("htm", "html", "txt", "xml"):
         raise BadInput(f"{wanted} is a .{ext} file and cannot be shown as text; open {doc_url}")
 
-    cache_key = f"{acc}|exhibit|{wanted}"
+    cache_key = f"{company.cik}|{acc}|exhibit|{wanted}"
     cached = await _cache_get(cache_key)
     if cached is not None:
         text, retrieved_at = cached

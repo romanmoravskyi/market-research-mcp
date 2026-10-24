@@ -7,6 +7,7 @@ All HTTP goes through `http.fetch("edgar", ...)`, which sets the User-Agent and 
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
@@ -148,16 +149,70 @@ async def get_ticker_table() -> tuple[list[CompanyRef], http.FetchResult]:
     return rows, res
 
 
-def _looks_like_name(q: str) -> bool:
-    """A company-name query: has a space, or is longer than 5 chars and not all caps.
+_SUFFIXES = frozenset(
+    {
+        "inc",
+        "incorporated",
+        "corp",
+        "corporation",
+        "co",
+        "company",
+        "ltd",
+        "limited",
+        "plc",
+        "llc",
+        "lp",
+        "sa",
+        "nv",
+        "ag",
+        "se",
+    }
+)
 
-    Short or all-caps single words ("MSF", "AMZ", "ZZZZNOTREAL") are treated as tickers, so a
-    typo never silently resolves to whichever company name happens to contain it.
+
+def _words(text: str) -> list[str]:
+    """Lower-case alphanumeric words ('Tesla, Inc.' -> ['tesla', 'inc'])."""
+    return re.findall(r"[a-z0-9]+", text.lower())
+
+
+def _core(words: list[str]) -> list[str]:
+    """Words without trailing corporate suffixes ('apple inc' -> 'apple')."""
+    out = list(words)
+    while len(out) > 1 and out[-1] in _SUFFIXES:
+        out.pop()
+    return out
+
+
+def _name_match(rows: list[CompanyRef], query: str) -> CompanyRef | None:
+    """The unique best company-name match for `query`, or None if none or ambiguous.
+
+    Tiers, best first: (1) the name without corporate suffixes equals the query; (2) the
+    name starts with the query's words; (3) the query's words appear as a phrase in the name.
+    The first tier with any hit decides; it must point at a single CIK (share classes of one
+    company share a CIK), otherwise the query is ambiguous.
     """
-    return " " in q or (len(q) > 5 and not q.isupper())
+    q = _core(_words(query))
+    if not q:
+        return None
+    n = len(q)
+    tiers: list[list[CompanyRef]] = [[], [], []]
+    for row in rows:
+        w = _words(row.name)
+        if _core(w) == q:
+            tiers[0].append(row)
+        elif w[:n] == q:
+            tiers[1].append(row)
+        elif any(w[i : i + n] == q for i in range(1, len(w) - n + 1)):
+            tiers[2].append(row)
+    for hits in tiers:
+        if hits:
+            # file order is roughly by market cap, so the first row is the primary listing
+            return hits[0] if len({r.cik for r in hits}) == 1 else None
+    return None
 
 
 def _match(rows: list[CompanyRef], query: str) -> CompanyRef | None:
+    """Exact CIK digits or ticker (case-insensitive) first, then a unique company-name match."""
     q = query.strip()
     if not q:
         return None
@@ -170,12 +225,7 @@ def _match(rows: list[CompanyRef], query: str) -> CompanyRef | None:
     for row in rows:
         if canonical_ticker(row.ticker) == norm:
             return row
-    if _looks_like_name(q):
-        low = q.lower()
-        for row in rows:  # file order is roughly by market cap, so the first hit is the likeliest
-            if low in row.name.lower():
-                return row
-    return None
+    return _name_match(rows, q)
 
 
 def _suggest(rows: list[CompanyRef], query: str) -> list[str]:
@@ -213,8 +263,8 @@ async def _lookup(query: str) -> tuple[CompanyRef, http.FetchResult]:
 async def get_company(query: str) -> CompanyRef:
     """Find a company by ticker (BRK.B / BRK-B), CIK digits, or company name.
 
-    Name matching applies only to name-like queries (see `_looks_like_name`); an unknown
-    ticker raises NotFound listing up to 3 suggestions.
+    An exact ticker wins; otherwise the company name must match one company unambiguously
+    (see `_name_match`). No or ambiguous match raises NotFound listing up to 3 suggestions.
     """
     return (await _lookup(query))[0]
 

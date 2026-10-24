@@ -20,6 +20,7 @@ from market_research_mcp.config import ConfigError, require
 from market_research_mcp.errors import BadInput, ToolError
 from market_research_mcp.models import Sourced, utcnow
 from market_research_mcp.sources import edgar
+from market_research_mcp.tickers import normalize_ticker
 
 __all__ = [
     "EDGAR_SOURCE",
@@ -123,9 +124,7 @@ def estimate_next(filing_dates: list[date], today: date, window_end: date) -> Es
 def _normalize(tickers: list[str]) -> list[str]:
     out: list[str] = []
     for t in tickers:
-        norm = (t or "").strip().upper()
-        if not norm or len(norm) > 12:
-            raise BadInput(f"ticker {t!r} is not a valid symbol")
+        norm = normalize_ticker(t)
         if norm not in out:
             out.append(norm)
     if not out:
@@ -135,12 +134,17 @@ def _normalize(tickers: list[str]) -> list[str]:
     return out
 
 
+def _finnhub_symbol(ticker: str) -> str:
+    """Finnhub writes US share classes with a dot ('BRK-B' -> 'BRK.B')."""
+    return ticker.replace("-", ".")
+
+
 async def _finnhub_row(ticker: str, start: date, end: date) -> EarningsRow:
     try:
         key = require("FINNHUB_API_KEY")
     except ConfigError:
         raise _Unavailable("FINNHUB_API_KEY is not set") from None
-    symbol = ticker.replace("-", ".")
+    symbol = _finnhub_symbol(ticker)
     try:
         res = await http.fetch(
             "finnhub",

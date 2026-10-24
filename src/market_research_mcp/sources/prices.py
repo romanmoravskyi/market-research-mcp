@@ -211,7 +211,17 @@ class TiingoProvider:
 
     async def splits(self, ticker: str, start: date, end: date) -> list[Split]:
         # Same request (and cache key) as history(ticker, start, end): one HTTP call serves both.
-        return splits_from_bars(await self.history(ticker, start, end))
+        # Parsed leniently: only date and splitFactor are needed, so missing OHLC is fine.
+        rows = await self._prices(ticker, start, end)
+        out: list[Split] = []
+        try:
+            for r in rows:
+                factor = _float(r.get("splitFactor")) or 1.0
+                if factor != 1.0:
+                    out.append(Split(date=date.fromisoformat(str(r["date"])[:10]), factor=factor))
+        except (AttributeError, KeyError, TypeError, ValueError) as exc:
+            raise ProviderDown(self.label, "unexpected response format", self.alternative) from exc
+        return sorted(out, key=lambda x: x.date)
 
 
 class YFinanceProvider:
@@ -472,8 +482,6 @@ async def get_split_history(
     ticker: str,
     start: date | None = None,
     end: date | None = None,
-    *,
-    bars: list[Bar] | None = None,
 ) -> list[Split]:
     """Public helper (not an MCP tool): stock splits for `ticker`, oldest first.
 
@@ -481,11 +489,9 @@ async def get_split_history(
     horizon, so the window defaults to the last 10 years (`start` = end - 10 years,
     `end` = today) instead of the full listed history. With Tiingo, a call with the same
     start/end as an earlier `history()` call is served from that cached response (no extra
-    HTTP). Pass `bars` already fetched to derive splits from them with no request at all.
-    Uses the configured price provider.
+    HTTP); `splits_from_bars` derives splits from bars already fetched. Uses the configured
+    price provider.
     """
-    if bars is not None:
-        return splits_from_bars(bars)
     end_d = end or _today()
     start_d = start or _years_before(end_d, SPLIT_WINDOW_YEARS)
     return await get_provider().splits(normalize_ticker(ticker), start_d, end_d)

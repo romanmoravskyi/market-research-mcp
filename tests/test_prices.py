@@ -328,3 +328,18 @@ def test_split_history_from_bars_needs_no_http():
     bars = mk_bars([1.0, 2.0, 3.0])
     bars[1] = bars[1].model_copy(update={"split_factor": 2.0})
     assert prices.splits_from_bars(bars) == [Split(date=bars[1].date, factor=2.0)]
+
+
+@respx.mock
+async def test_split_history_tolerates_rows_without_ohlc(respx_mock):
+    rows = [
+        {k: v for k, v in r.items() if k not in ("open", "high", "low", "volume")} for r in ROWS
+    ]
+    respx_mock.get(PRICES_URL).mock(return_value=httpx.Response(200, json=rows))
+    splits = await prices.get_split_history("MSFT")
+    assert splits == [Split(date=date(2023, 3, 15), factor=4.0)]
+
+
+async def test_split_history_has_no_dead_bars_param():
+    with pytest.raises(TypeError):
+        await prices.get_split_history("MSFT", bars=[])

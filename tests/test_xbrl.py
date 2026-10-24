@@ -239,3 +239,18 @@ async def test_cover_share_count_dated_on_period_end_stays_with_that_period(sec)
     assert q2.fiscal_period == "Q2" and q2.period_end == date(2026, 6, 30)
     assert q2.value == 2_658_186_195
     assert q1.fiscal_period == "Q1" and q1.period_end < date(2026, 6, 30)
+
+
+@pytest.mark.parametrize(
+    ("end", "label"),
+    [
+        (date(2021, 9, 30), (2022, "Q1")),  # older than every annual period
+        (date(2022, 3, 31), (2022, "Q3")),
+        (date(2019, 6, 30), (2019, "Q4")),
+        (date(2025, 3, 31), (2025, "Q3")),  # inside the known annual periods
+        (date(2026, 12, 31), (2027, "Q2")),  # newer than every annual period
+    ],
+)
+def test_fiscal_label_extrapolates_outside_annual_periods(end, label):
+    fy_ends = [date(2024, 6, 30), date(2025, 6, 30)]
+    assert xbrl._fiscal_label(end, "quarterly", fy_ends) == label

@@ -4,7 +4,7 @@ served from gzip fixtures in tests/fixtures/sec/docs/ (see scripts/record_doc_fi
 import gzip
 import json
 import os
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import httpx
@@ -24,9 +24,10 @@ CIK = MANIFEST["cik"]
 TENK = MANIFEST["tenk"]
 EIGHTK = MANIFEST["eightk"]
 ARCHIVES = f"https://www.sec.gov/Archives/edgar/data/{CIK}/"
+AAPL_ARCHIVES = "https://www.sec.gov/Archives/edgar/data/320193/"
 TICKERS = {
     "fields": ["cik", "name", "ticker", "exchange"],
-    "data": [[CIK, "MICROSOFT CORP", "MSFT", "Nasdaq"]],
+    "data": [[CIK, "MICROSOFT CORP", "MSFT", "Nasdaq"], [320193, "Apple Inc.", "AAPL", "Nasdaq"]],
 }
 
 
@@ -83,6 +84,14 @@ def sec():
             "eightk_index": mock.get(
                 _folder(EIGHTK["accession"]) + EIGHTK["accession"] + "-index.htm"
             ).mock(return_value=httpx.Response(200, content=_gz("msft_8k_index.htm.gz"))),
+            # EDGAR answering an AAPL-folder URL with MSFT's index: the filer CIK must be checked.
+            "aapl_tenk_index": mock.get(
+                AAPL_ARCHIVES
+                + TENK["accession"].replace("-", "")
+                + "/"
+                + TENK["accession"]
+                + "-index.htm"
+            ).mock(return_value=httpx.Response(200, content=_gz("msft_10k_index.htm.gz"))),
             "ex99": mock.get(_folder(EIGHTK["accession"]) + EIGHTK["ex99_1"]).mock(
                 return_value=httpx.Response(200, content=_gz("msft_8k_ex99_1.htm.gz"))
             ),
@@ -194,6 +203,52 @@ async def test_empty_section_is_not_found(sec, monkeypatch):
     monkeypatch.setattr(edgar_docs, "_extract_sections", without_1c)
     with pytest.raises(NotFound):
         await edgar_docs.get_filing_section("MSFT", TENK["accession"], "1C")
+
+
+async def test_accession_of_other_company_is_bad_input(sec):
+    """A cached MSFT filing must not be served under AAPL; the index's filer CIK is checked."""
+    await edgar_docs.get_filing_section("MSFT", TENK["accession"], "1A")
+    aapl_index = sec["aapl_tenk_index"]
+    with pytest.raises(BadInput) as exc:
+        await edgar_docs.get_filing_section("AAPL", TENK["accession"], "1A")
+    assert aapl_index.call_count == 1  # not answered from the MSFT cache entry
+    assert "320193" in str(exc.value) or "AAPL" in str(exc.value)
+    with pytest.raises(BadInput):
+        await edgar_docs.get_filing_exhibit("AAPL", TENK["accession"], "EX-21.1")
+
+
+async def test_empty_extraction_is_not_cached(sec, monkeypatch):
+    good = edgar_docs._extract_sections
+    monkeypatch.setattr(edgar_docs, "_extract_sections", lambda html, form: {})
+    with pytest.raises(NotFound):
+        await edgar_docs.get_filing_section("MSFT", TENK["accession"], "1A")
+    monkeypatch.setattr(edgar_docs, "_extract_sections", good)
+    r = await edgar_docs.get_filing_section("MSFT", TENK["accession"], "1A")
+    assert r.text.strip()
+    assert sec["tenk_doc"].call_count == 2
+
+
+async def test_partial_extraction_cached_with_short_ttl(sec, env, monkeypatch):
+    real = edgar_docs._extract_sections
+
+    def without_1c(html, form):
+        out = real(html, form)
+        out.pop("1C", None)
+        return out
+
+    monkeypatch.setattr(edgar_docs, "_extract_sections", without_1c)
+    with pytest.raises(NotFound):
+        await edgar_docs.get_filing_section("MSFT", TENK["accession"], "1C")
+    key = f"{int(CIK):010d}|{TENK['accession']}|sections"
+    assert not env.get(edgar_docs.NS, key).expired
+    later = edgar_docs.utcnow() + timedelta(days=2)
+    assert env.get(edgar_docs.NS, key, now=later).expired
+
+
+async def test_expired_cache_entry_is_a_miss(env):
+    past = edgar_docs.utcnow() - timedelta(days=3)
+    env.set(edgar_docs.NS, "k", "v", 3600, past)
+    assert await edgar_docs._cache_get("k") is None
 
 
 # ---------------------------------------------------------------- exhibits

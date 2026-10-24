@@ -313,3 +313,33 @@ async def test_ticker_typo_not_found_with_suggestions(sec, typo, suggestion):
 @pytest.mark.parametrize("name", ["Microsoft", "microsoft corp", "MICROSOFT CORP"])
 async def test_name_query_still_resolves(sec, name):
     assert (await edgar.get_company(name)).ticker == "MSFT"
+
+
+@pytest.mark.parametrize(
+    ("query", "ticker"),
+    [
+        ("MSFT", "MSFT"),
+        ("msft", "MSFT"),
+        ("Apple", "AAPL"),
+        ("apple", "AAPL"),
+        ("Intel", "INTC"),
+        ("Visa", "V"),
+        ("Nike", "NKE"),
+        ("Tesla", "TSLA"),
+        ("NVIDIA", "NVDA"),
+    ],
+)
+async def test_short_company_names_resolve(sec, query, ticker):
+    assert (await edgar.get_company(query)).ticker == ticker
+
+
+async def test_ambiguous_name_not_found_with_suggestions(sec):
+    # "Intelligent" starts several different companies' names: no unique best match.
+    with pytest.raises(NotFound) as ei:
+        await edgar.get_company("Intelligent")
+    assert "did you mean" in str(ei.value)
+
+
+async def test_nonsense_name_not_found(sec):
+    with pytest.raises(NotFound):
+        await edgar.get_company("qwxzv plorkington")

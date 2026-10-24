@@ -264,22 +264,27 @@ def fiscal_year_for(end: date) -> int:
 def _fiscal_label(end: date, periods: Periods, fy_ends: list[date]) -> tuple[int, str | None]:
     if periods == "annual":
         return fiscal_year_for(end), "FY"
-    fy_end = next((e for e in fy_ends if 0 <= (e - end).days < 370), None)
-    if fy_end is None and fy_ends:
-        fy_end = fy_ends[-1]
-        while fy_end < end - timedelta(days=5):
-            fy_end = _add_year(fy_end)
-    if fy_end is None:
+    if not fy_ends:
         return fiscal_year_for(end), None
+    fy_end = next((e for e in fy_ends if 0 <= (e - end).days < 370), None)
+    if fy_end is None:
+        # Outside the known annual periods (or a gap): extrapolate the fiscal-year-end date
+        # in whole years from the nearest known one until it is the first on or after `end`.
+        floor = end - timedelta(days=5)
+        fy_end = next((e for e in sorted(fy_ends) if e >= floor), max(fy_ends))
+        while _add_year(fy_end, -1) >= floor:
+            fy_end = _add_year(fy_end, -1)
+        while fy_end < floor:
+            fy_end = _add_year(fy_end)
     quarter = 4 - round((fy_end - end).days / 91.31)
     return fiscal_year_for(fy_end), f"Q{min(4, max(1, quarter))}"
 
 
-def _add_year(d: date) -> date:
+def _add_year(d: date, years: int = 1) -> date:
     try:
-        return d.replace(year=d.year + 1)
+        return d.replace(year=d.year + years)
     except ValueError:  # Feb 29
-        return d.replace(year=d.year + 1, day=28)
+        return d.replace(year=d.year + years, day=28)
 
 
 # ---------------------------------------------------------------- output models
