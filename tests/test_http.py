@@ -188,3 +188,25 @@ async def test_not_found_message_redacted(respx_mock):
     with pytest.raises(NotFound) as ei:
         await http.fetch("finnhub", URL, params={"token": SECRET})
     assert SECRET not in str(ei.value)
+
+
+@respx.mock
+async def test_4xx_exposes_truncated_body(respx_mock):
+    respx_mock.get(URL).mock(return_value=httpx.Response(400, text="x" * 2000))
+    with pytest.raises(ProviderDown) as ei:
+        await http.fetch("x", URL, params={"api_key": SECRET})
+    assert ei.value.body == "x" * 500
+    assert "x" * 600 not in str(ei.value)
+
+
+@respx.mock
+async def test_4xx_body_never_contains_url_or_key(respx_mock):
+    full = str(httpx.URL(URL, params={"api_key": SECRET}))
+    respx_mock.get(URL).mock(return_value=httpx.Response(400, text=f"bad {full} key {SECRET}"))
+    with pytest.raises(ProviderDown) as ei:
+        await http.fetch("x", URL, params={"api_key": SECRET})
+    assert SECRET not in ei.value.body and URL not in ei.value.body
+
+
+def test_provider_down_body_defaults_none():
+    assert ProviderDown("x").body is None

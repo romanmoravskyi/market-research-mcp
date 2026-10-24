@@ -284,7 +284,7 @@ async def test_split_history(respx_mock):
     route = respx_mock.get(PRICES_URL).mock(return_value=httpx.Response(200, json=ROWS))
     splits = await prices.get_split_history("MSFT")
     assert splits == [Split(date=date(2023, 3, 15), factor=4.0)]
-    assert route.calls.last.request.url.params["startDate"] == "1962-01-01"
+    assert route.call_count == 1
 
 
 async def test_tools_registered():
@@ -304,3 +304,27 @@ async def test_live_tiingo_history(monkeypatch):
         pytest.skip("TIINGO_API_KEY not set")
     res = await prices.get_price_history("MSFT", limit=5)
     assert res.provider == "tiingo" and len(res.bars) == 5
+
+
+@respx.mock
+async def test_split_history_default_window_is_ten_years(respx_mock, monkeypatch):
+    monkeypatch.setattr(prices, "_today", lambda: date(2026, 10, 23))
+    route = respx_mock.get(PRICES_URL).mock(return_value=httpx.Response(200, json=ROWS))
+    await prices.get_split_history("MSFT")
+    assert route.calls.last.request.url.params["startDate"] == "2016-10-23"
+
+
+@respx.mock
+async def test_split_history_shares_history_request(respx_mock):
+    route = respx_mock.get(PRICES_URL).mock(return_value=httpx.Response(200, json=ROWS))
+    start, end = date(2020, 1, 1), date(2026, 10, 23)
+    await prices.get_provider().history("MSFT", start, end)
+    splits = await prices.get_split_history("MSFT", start=start, end=end)
+    assert splits == [Split(date=date(2023, 3, 15), factor=4.0)]
+    assert route.call_count == 1
+
+
+def test_split_history_from_bars_needs_no_http():
+    bars = mk_bars([1.0, 2.0, 3.0])
+    bars[1] = bars[1].model_copy(update={"split_factor": 2.0})
+    assert prices.splits_from_bars(bars) == [Split(date=bars[1].date, factor=2.0)]

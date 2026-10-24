@@ -55,7 +55,16 @@ class RateLimited(ToolError):
 class ProviderDown(ToolError):
     """The provider failed (5xx, timeout, connection error, unexpected response)."""
 
-    def __init__(self, source: str, detail: str = "", alternative: str | None = None) -> None:
+    def __init__(
+        self,
+        source: str,
+        detail: str = "",
+        alternative: str | None = None,
+        *,
+        body: str | None = None,
+    ) -> None:
+        # `body`: the provider's error response text for HTTP 4xx (redacted, at most 500
+        # chars, request URL removed). Kept out of the message; callers may inspect it.
         msg = f"{source} is unavailable"
         if detail:
             msg += f" ({detail})"
@@ -66,6 +75,7 @@ class ProviderDown(ToolError):
         self.source = source
         self.detail = detail
         self.alternative = alternative
+        self.body = body
 
 
 class BadInput(ToolError):

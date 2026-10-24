@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
@@ -84,6 +85,22 @@ def _retry_after(resp: httpx.Response) -> float | None:
         return float(value) if value is not None else None
     except ValueError:
         return None
+
+
+MAX_ERROR_BODY_CHARS = 500
+_SECRET_PARAM = re.compile(r"key|token|secret|password|^t$", re.IGNORECASE)
+
+
+def _error_body(resp: httpx.Response, url: str, params: dict[str, Any] | None) -> str:
+    """Error response text for callers: request URL and secret param values removed."""
+    try:
+        text = resp.text
+    except Exception:  # undecodable body
+        return ""
+    secrets = [str(v) for k, v in (params or {}).items() if _SECRET_PARAM.search(k) and str(v)]
+    for needle in (str(httpx.URL(url, params=params)), url, *secrets):
+        text = text.replace(needle, "")
+    return redact(text)[:MAX_ERROR_BODY_CHARS]
 
 
 async def fetch(
@@ -172,7 +189,8 @@ async def fetch(
             raise ProviderDown(source, f"HTTP {status}", alternative)
         if status >= 400:
             logger.warning("%s HTTP %d: %s", source, status, url_redacted)
-            raise ProviderDown(source, f"HTTP {status}", alternative)
+            body = _error_body(resp, url, params)
+            raise ProviderDown(source, f"HTTP {status}", alternative, body=body)
         break
 
     raw = resp.content
