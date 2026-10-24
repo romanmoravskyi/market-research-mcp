@@ -462,3 +462,19 @@ async def test_live_msft_insiders():
     assert res.source == "SEC EDGAR Form 4"
     assert res.filings_fetched >= 1
     json.dumps(res.model_dump(mode="json"))
+
+
+async def test_capped_result_states_the_window_the_summary_covers(sec, monkeypatch):
+    # A capped call fetches only the newest filings, so "since" overstates coverage. The
+    # response must say from which filing date the summary is complete.
+    monkeypatch.setattr(insiders, "MAX_FILINGS", 3)
+    res = await insiders.get_insider_transactions("MSFT")
+    oldest = min(r.filing_date for r in res.items)
+    assert res.covered_since == oldest
+    assert res.covered_since > res.since
+    assert any(f"covers filings from {oldest.isoformat()}" in n for n in res.notes)
+
+
+async def test_uncapped_result_covers_since(sec):
+    res = await insiders.get_insider_transactions("MSFT", since="2026-09-16")
+    assert res.covered_since == res.since == date(2026, 9, 16)

@@ -155,6 +155,9 @@ class InsiderTransactions(SourcedList[InsiderTransaction]):
     since: date
     filings_fetched: int
     filings_capped: bool
+    # Filing date from which the summary is complete: `since`, or when capped the oldest
+    # fetched filing's date.
+    covered_since: date
     summary: InsiderSummary
 
 
@@ -452,6 +455,9 @@ async def get_insider_transactions(
     capped = len(filings) > MAX_FILINGS
     total_filings = len(filings)
     filings = filings[:MAX_FILINGS]
+    covered_since = (
+        min((f.filing_date for f in filings), default=since_date) if capped else since_date
+    )
 
     notes: list[str] = [
         "Non-derivative codes P and S are open-market or private purchases/sales of the "
@@ -463,7 +469,9 @@ async def get_insider_transactions(
     if capped:
         notes.append(
             f"Filings capped: fetched the newest {MAX_FILINGS} of {total_filings} Form 4 "
-            f"filings since {since_date.isoformat()}. Use a later `since` for full coverage."
+            f"filings since {since_date.isoformat()}; the summary covers filings from "
+            f"{covered_since.isoformat()} (covered_since) onward. Use a later `since` for "
+            "full coverage."
         )
 
     sem = asyncio.Semaphore(FETCH_CONCURRENCY)
@@ -535,6 +543,7 @@ async def get_insider_transactions(
         since=since_date,
         filings_fetched=fetched,
         filings_capped=capped,
+        covered_since=covered_since,
         summary=summary,
     )
 
