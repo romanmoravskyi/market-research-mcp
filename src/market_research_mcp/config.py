@@ -5,6 +5,7 @@ Missing keys never crash startup. Tools call `require(name)` when they need a va
 
 from __future__ import annotations
 
+import functools
 import os
 from pathlib import Path
 
@@ -53,6 +54,12 @@ def load_settings(dotenv: bool = True) -> Settings:
     if "cache_path" in values:
         values["cache_path"] = Path(str(values["cache_path"])).expanduser()
     return Settings(**values)
+
+
+@functools.lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    """Process-wide Settings, loaded once. Call `get_settings.cache_clear()` in tests."""
+    return load_settings()
 
 
 def require(name: str) -> str:
