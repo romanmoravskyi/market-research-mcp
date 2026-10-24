@@ -75,3 +75,16 @@ def test_skill_keeps_hard_rules():
     assert "not financial advice" in text
     assert "price targets" in text
     assert "JOURNAL_DIR" in text
+
+
+def test_mcp_launch_skips_dev_deps_and_lock_resolution():
+    args = _load(PLUGIN_JSON)["mcpServers"]["market-research"]["args"]
+    assert "--no-dev" in args
+    assert "--frozen" in args
+
+
+def test_skill_commands_skip_dev_deps():
+    text = SKILL_MD.read_text(encoding="utf-8")
+    for line in text.splitlines():
+        if "uv run" in line:
+            assert "--no-dev --frozen" in line, line

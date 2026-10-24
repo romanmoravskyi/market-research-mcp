@@ -18,28 +18,35 @@ Read-only research. The user makes every investment decision.
 2. `get_fundamentals(ticker, metrics=[revenue, net_income, diluted_eps, operating_cash_flow,
    capex, total_debt, cash, shares_diluted], periods="annual", n=5)`, then the same with
    `periods="quarterly", n=8`. Keep XBRL tag, period start/end and filed date per value.
-3. `get_key_ratios(ticker)` -> margins, revenue growth YoY and 3y CAGR, FCF, net debt,
-   share-count change.
+3. Ratios: margins, revenue growth YoY and 3y CAGR, FCF, net debt, share-count change. Use
+   `get_key_ratios(ticker)` if the server lists it. Otherwise compute the ratios from the
+   step 2 `get_fundamentals` values and show the formula and inputs for each (e.g. "FCF =
+   operating_cash_flow - capex = $X - $Y"), citing the same sources.
 4. `get_price_stats(ticker)` -> 1m/3m/1y/5y returns, max drawdown, 52w range, volatility;
    record `provider` and `as_of`.
 5. Latest 10-K: `list_filings(ticker, forms=["10-K"], limit=1)`, then
-   `get_filing_section(accession, "1A")` (follow `cursor` until done). Summarize the top 5
+   `get_filing_section(ticker, accession, "1A")` (pass the returned `next_cursor` as
+   `cursor` until there is none). Summarize the top 5
    risks in one line each, in neutral words; cite the filing URL with accession number.
 6. Last 2 earnings releases: `list_filings(ticker, forms=["8-K"], since=<18 months ago>)`,
-   keep 8-Ks with Item 2.02, take the latest 2, `get_filing_exhibit(accession, "EX-99.1")`.
+   keep 8-Ks with Item 2.02, take the latest 2, `get_filing_exhibit(ticker, accession, "EX-99.1")`.
    Extract reported headline figures only (revenue, EPS, guidance if stated), each cited.
 7. Insiders, last 12 months: `get_insider_transactions(ticker, since=<12 months ago>)`.
    Headline: only codes P (open-market purchase) and S (open-market sale): counts, shares,
    value. All other codes (A, M, F, G, ...) go in a footnote as counts, labelled "not
    open-market trades".
 8. `get_earnings_calendar([ticker], days_ahead=120)` -> next earnings date, or "none found".
-9. Choose the output folder: if the environment variable `JOURNAL_DIR` is set, use
-   `$JOURNAL_DIR/analyses/`; otherwise use `./analyses/` under the current working directory.
+9. Choose the output folder. Get `JOURNAL_DIR` from the same settings the server uses
+   (environment, `MRM_ENV_FILE` or the per-user `.env`, then `.env` in the current folder).
+   In the Claude Code plugin, run
+   `uv run --quiet --no-dev --frozen --project "${CLAUDE_PLUGIN_ROOT}" python -m market_research_mcp.config journal-dir`;
+   elsewhere, read the `JOURNAL_DIR` environment variable. If it gives a path, use
+   `<JOURNAL_DIR>/analyses/`; otherwise use `./analyses/` under the current working directory.
    Create the folder if needed. Write the one-pager to `<folder>/<TICKER>-<YYYY-MM-DD>.md`
    (today's date) using the template below. Footnote refs `[n]` must match the numbered
    Sources list. If you cannot write files, return the one-pager as your answer instead.
 10. Check sources. In the Claude Code plugin, run
-    `uv run --directory "${CLAUDE_PLUGIN_ROOT}" python skills/analyze-ticker/scripts/check_sources.py "<absolute path to the one-pager>"`.
+    `uv run --quiet --no-dev --frozen --project "${CLAUDE_PLUGIN_ROOT}" python "${CLAUDE_PLUGIN_ROOT}/skills/analyze-ticker/scripts/check_sources.py" "<path to the one-pager>"`.
     Elsewhere, run `check_sources.py` from the `skills/analyze-ticker/scripts/` folder of the
     market-research-mcp repository the same way, or, if you cannot run it, check every line
     by hand against the hard rules. Fix every flagged line (add the source, move it to

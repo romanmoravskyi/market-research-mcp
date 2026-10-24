@@ -34,14 +34,16 @@ this MCP server and adds the `analyze-ticker` skill (a sourced one-page brief pe
 by `skills/analyze-ticker/scripts/check_sources.py`).
 
 1. Install [uv](https://docs.astral.sh/uv/). The plugin runs the server with `uv run`.
-2. Set the environment variables below in your shell profile, or in the `env` block of
-   `~/.claude/settings.json`. The server inherits them; no key is stored in plugin files.
+2. Put your keys in the per-user settings file (create it from `.env.example`):
+   `%APPDATA%/market-research-mcp/.env` on Windows, `~/.config/market-research-mcp/.env`
+   elsewhere. Real environment variables also work and take precedence. Do not put a `.env`
+   in the plugin folder: it is replaced on every plugin update and is never read.
    - `SEC_USER_AGENT`: your name and email, required by the
      [SEC fair access policy](https://www.sec.gov/os/accessing-edgar-data). No key needed.
    - `FRED_API_KEY`: free key from [FRED](https://fred.stlouisfed.org/docs/api/api_key.html).
    - `TIINGO_API_KEY` (from [Tiingo](https://www.tiingo.com/account/api/token)) or
      `FINNHUB_API_KEY` (from [Finnhub](https://finnhub.io/dashboard)) with `PRICE_PROVIDER`.
-   - Optional `JOURNAL_DIR`: briefs go to `$JOURNAL_DIR/analyses/`, otherwise `./analyses/`.
+   - Optional `JOURNAL_DIR`: briefs go to `<JOURNAL_DIR>/analyses/`, otherwise `./analyses/`.
 3. In Claude Code, add the marketplace (replace `<owner>` with the GitHub owner of this
    repository): `/plugin marketplace add <owner>/market-research-mcp`
 4. Install the plugin: `/plugin install market-research@market-research-mcp`, then restart
@@ -60,7 +62,18 @@ by `skills/analyze-ticker/scripts/check_sources.py`).
 | `FINNHUB_API_KEY` | Prices via Finnhub | none |
 | `CACHE_PATH` | SQLite cache location | `~/.market-research/cache.db` |
 | `LOG_LEVEL` | Log verbosity (logs go to stderr) | `INFO` |
-| `JOURNAL_DIR` | Output folder for `analyze-ticker` briefs (skill only) | `./analyses/` |
+| `JOURNAL_DIR` | Output folder for `analyze-ticker` briefs | `./analyses/` |
+| `MRM_ENV_FILE` | Path of a `.env` file to use instead of the per-user one | none |
+
+Where settings come from, highest priority first:
+
+1. Real environment variables.
+2. The file named by `MRM_ENV_FILE`, if set. Otherwise the per-user file
+   `%APPDATA%/market-research-mcp/.env` (Windows) or `~/.config/market-research-mcp/.env`
+   (elsewhere; `$XDG_CONFIG_HOME` is honoured).
+3. `.env` in the current working directory (for a clone, the repository root).
+
+A `.env` inside the installed plugin folder (`CLAUDE_PLUGIN_ROOT`) is never read.
 
 Missing keys do not stop the server; a tool that needs a key returns an error naming it.
 

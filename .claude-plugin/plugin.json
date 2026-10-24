@@ -11,7 +11,15 @@
   "mcpServers": {
     "market-research": {
       "command": "uv",
-      "args": ["run", "--quiet", "--directory", "${CLAUDE_PLUGIN_ROOT}", "market-research-mcp"]
+      "args": [
+        "run",
+        "--quiet",
+        "--no-dev",
+        "--frozen",
+        "--project",
+        "${CLAUDE_PLUGIN_ROOT}",
+        "market-research-mcp"
+      ]
     }
   }
 }

@@ -2,7 +2,7 @@
 
 > TEST FIXTURE: fictional company, all numbers fake. Used only by tests/test_check_sources.py.
 
-Ticker: EXMPL | CIK: 0000999999 | Exchange: NASDAQ | Generated: 2026-10-24
+CIK: 0000999999 | Exchange: NASDAQ | SIC: 7372 | Generated: 2026-10-24
 
 ## Snapshot
 
@@ -54,7 +54,7 @@ Expected 2026-11-05 (UNVERIFIED date confirmation from company IR) [6]
 
 1. SEC company facts, https://data.sec.gov/submissions/CIK0000999999.json, retrieved 2026-10-24
 2. 10-K accession 0000999999-25-000123, https://www.sec.gov/Archives/edgar/data/999999/000099999925000123/, filed 2025-08-01
-3. get_key_ratios computed from SEC XBRL, https://data.sec.gov/api/xbrl/companyfacts/CIK0000999999.json, as of 2025-08-01
+3. Ratios computed from get_fundamentals values (SEC XBRL), https://data.sec.gov/api/xbrl/companyfacts/CIK0000999999.json, as of 2025-08-01
 4. ExampleFeed price stats, https://example.com/prices/EXMPL, as of 2026-10-23
 5. Form 4 filings, https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=0000999999&type=4, retrieved 2026-10-24
 6. Earnings calendar, https://example.com/calendar/EXMPL, retrieved 2026-10-24

@@ -36,6 +36,7 @@ NON_FINANCIAL_PATTERNS = [
     re.compile(r"\b\d{10}-\d{2}-\d{6}\b"),  # SEC accession number
     re.compile(r"\b\d{18}\b"),  # accession number without dashes
     re.compile(r"\bCIK[\s|:#]*\d{1,10}\b", re.IGNORECASE),
+    re.compile(r"\bSIC[\s|:#]*\d{4}\b"),  # SIC industry code
     re.compile(r"\b0\d{9}\b"),  # zero-padded 10-digit CIK
     re.compile(r"\b\d{4}-\d{2}-\d{2}(?:T[\d:.]+Z?)?\b"),  # ISO dates / timestamps
     re.compile(r"\b\d{4}-\d{2}\b"),  # year-month
@@ -45,12 +46,29 @@ NON_FINANCIAL_PATTERNS = [
     re.compile(r"\bForm\s+[345]\b", re.IGNORECASE),
     re.compile(r"\bItem\s+\d+[A-Z]?(?:\.\d+)?\b", re.IGNORECASE),
     re.compile(r"\bEX-\d+(?:\.\d+)?\b", re.IGNORECASE),
-    re.compile(r"\b(?:FY|CY|Q[1-4]\s*FY|Q[1-4]|H[12])\s?'?\d{2,4}\b", re.IGNORECASE),
+    # Fiscal periods: FY2025, Q3 FY2025, Q4 2025, Q3'25. A bare 2-digit number after a
+    # quarter label ("Q2 42%") is a metric, not a year, so it needs FY, an apostrophe or 4 digits.
+    re.compile(r"\b(?:FY|CY)\s?'?(?:\d{4}|\d{2})\b(?![\d%]|[.,]\d)", re.IGNORECASE),
+    re.compile(r"\b[QH][1-4]\s*(?:FY\s?'?\d{2,4}|'\d{2}|\d{4})\b(?![\d%]|[.,]\d)", re.I),
     re.compile(r"\b[QH][1-4]\b"),
-    re.compile(r"\b\d{1,2}[ywd]\b"),  # period labels: 1y, 5y, 52w, 30d
-    re.compile(r"\b(?:1|3|6|9|12)m\b"),  # period labels: 1m, 3m, 12m (lowercase only)
-    re.compile(r"\b\d{1,3}\s+(?:months?|years?|quarters?|weeks?|days?)\b", re.I),  # durations
-    re.compile(r"(?<![$\d.,])\b(?:19|20)\d{2}\b(?![\d.,%]|\s?[BMK]\b)"),  # bare years
+    re.compile(r"(?<![$\d.,])\b\d{1,2}[ywd]\b"),  # period labels: 1y, 5y, 52w, 30d
+    re.compile(r"(?<![$\d.,])\b(?:1|3|6|9|12)m\b"),  # period labels: 1m, 3m, 12m (not $3m)
+    # Durations only as look-back windows ("last 12 months", "within 120 days", "(12 months)").
+    re.compile(
+        r"(?:\b(?:within|last|past|next|over|trailing)\s+|\()"
+        r"\d{1,3}\s+(?:months?|years?|quarters?|weeks?|days?)\b\)?",
+        re.IGNORECASE,
+    ),
+    # Years only in date context ("in 2025", "since 2021", "fiscal 2024", "December 2025").
+    re.compile(
+        r"\b(?:in|since|during|until|through|fiscal|calendar|year|"
+        r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|"
+        r"sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?,?\s+"
+        r"(?:\d{1,2},?\s+)?(?:19|20)\d{2}\b(?![\d%]|[.,]\d|\s?[BMK]\b)",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\((?:19|20)\d{2}\)"),  # "(2025)"
+    re.compile(r"\b10b5-1\b", re.IGNORECASE),  # SEC Rule 10b5-1
 ]
 
 # Phrases explicitly allowed even though they contain a banned word.
@@ -60,16 +78,26 @@ ALLOWED_PHRASES = [
     re.compile(r"\bbuy[- ]?backs?\b", re.IGNORECASE),
 ]
 
+# Recommendation language only, as phrases, so names like "Best Buy" and words like
+# "buy-side" or "insiders sell" pass. Longer phrases first so each hit is reported once.
 BANNED_PHRASES = [
+    "we recommend buying",
+    "we recommend selling",
+    "we recommend",
     "strong buy",
+    "strong sell",
+    "buy rating",
     "sell rating",
+    "hold rating",
+    "should buy",
+    "should sell",
     "price target",
     "undervalued",
     "overvalued",
-    "we recommend",
-    "should buy",
-    "should sell",
-    "buy",
+    "overweight",
+    "underweight",
+    "outperform",
+    "underperform",
 ]
 BANNED_RES = [(p, re.compile(rf"\b{re.escape(p)}\b", re.IGNORECASE)) for p in BANNED_PHRASES]
 
@@ -172,9 +200,9 @@ def check_text(text: str) -> list[Problem]:
         if not refs:
             problems.append(Problem(idx, "number without source URL or footnote ref [n]"))
             continue
-        good = [n for n in refs if sources.get(n)]
-        if not good:
-            bad = ", ".join(f"[{n}]" for n in refs)
+        bad_refs = [n for n in dict.fromkeys(refs) if not sources.get(n)]
+        if bad_refs:
+            bad = ", ".join(f"[{n}]" for n in bad_refs)
             problems.append(
                 Problem(idx, f"footnote {bad} does not resolve to a Sources entry with a URL")
             )

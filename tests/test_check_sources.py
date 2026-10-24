@@ -105,3 +105,84 @@ def test_cli_exit_codes(tmp_path, capsys):
     assert "line 3:" in capsys.readouterr().out
     assert cs.main([str(tmp_path / "missing.md")]) == 2
     assert cs.main([]) == 2
+
+
+# Review fixes (PR #6). Each case named in the review.
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Revenue $3m in the quarter.",  # finding 2
+        "Revenue $12m in the quarter.",  # finding 2
+        "Q2 42% gross margin.",  # finding 3
+        "H1 120 stores opened.",  # finding 3
+        "Insiders sold 2000 shares.",  # finding 4
+        "DSO 45 days",  # finding 4
+    ],
+)
+def test_review_unsourced_numbers_flagged(line):
+    out = reasons(doc(line + "\n"))
+    assert len(out) == 1, out
+    assert "without source" in out[0]
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Q3 FY2025, Q4 2025 and Q3'25 were reviewed.",
+        "Revenue grew in 2025 and since 2021.",
+        "Results for fiscal 2024 and December 2025 are included.",
+        "Insider activity over the last 12 months (12 months window).",
+        "None found within 120 days.",
+        "## Insiders (12 months)",
+    ],
+)
+def test_review_period_labels_still_not_flagged(line):
+    assert reasons(doc(line + "\n")) == []
+
+
+def test_review_template_header_with_sic_passes():  # finding 6
+    line = "CIK: 0000999999 | Exchange: NASDAQ | SIC: 7372 | Generated: 2026-10-24\n"
+    assert reasons(doc(line)) == []
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "# Best Buy Co., Inc. (BBY) - research brief",  # finding 5
+        "Buy-side analysts attended the call.",
+        "Open-market buys: 2 purchases [1].",
+        "The company announced a share buyback program.",
+        "Insiders sell shares under 10b5-1 plans.",
+    ],
+)
+def test_review_company_names_and_neutral_words_pass(line):
+    assert reasons(doc(line + "\n")) == []
+
+
+@pytest.mark.parametrize(
+    ("line", "phrase"),
+    [
+        ("Analysts have a Strong Buy on it.", "strong buy"),
+        ("It carries a buy rating.", "buy rating"),
+        ("Rating: outperform.", "outperform"),
+        ("Shares were upgraded to Overweight.", "overweight"),
+        ("Moved to underweight.", "underweight"),
+        ("Hold rating maintained.", "hold rating"),
+        ("Sell rating issued.", "sell rating"),
+        ("We recommend buying the shares.", "we recommend buying"),
+        ("The price target is unchanged.", "price target"),
+        ("Shares look undervalued.", "undervalued"),
+    ],
+)
+def test_review_recommendation_phrases_flagged(line, phrase):  # findings 5 and 7
+    out = reasons(doc(line + "\n"))
+    assert any(f"'{phrase}'" in r for r in out), out
+
+
+def test_review_every_unresolved_ref_reported():  # finding 8
+    out = reasons(doc("Revenue $1B [1], margin 40% [9]\n"))
+    assert len(out) == 1, out
+    assert "[9]" in out[0]
+    assert "[1]" not in out[0]
