@@ -89,3 +89,42 @@ def test_skill_ratios_step_has_fallback():
     assert "get_key_ratios" in body
     assert "get_fundamentals" in body.split("get_key_ratios", 1)[1].split("\n4.", 1)[0]
     assert "formula" in body
+
+
+async def test_skill_bare_positional_args_use_the_parameter_name():
+    # `resolve_ticker(ticker)` reads as a `ticker=` keyword, but the parameter is `query`;
+    # a bare identifier passed positionally must be the parameter's own name.
+    tools = {t.name: t.inputSchema for t in await build_server().list_tools()}
+    for name, arg_text in CALL_RE.findall(SKILL_MD.read_text(encoding="utf-8")):
+        if name not in tools:
+            continue
+        params = list(tools[name]["properties"])
+        for i, arg in enumerate(_split_args(arg_text)):
+            if "=" in arg:
+                break
+            if re.fullmatch(r"[a-z_]+", arg):
+                assert arg == params[i], f"{name}: positional '{arg}' is parameter '{params[i]}'"
+
+
+def test_skill_8k_listing_passes_a_limit_above_default():
+    # Default limit=20 truncates busy filers (JPM, O) within 18 months, which can hide
+    # Item 2.02 filings.
+    calls = [a for n, a in CALL_RE.findall(SKILL_MD.read_text(encoding="utf-8"))]
+    eight_k = [a for a in calls if '"8-K"' in a]
+    assert eight_k
+    for a in eight_k:
+        m = re.search(r"limit=(\d+)", a)
+        assert m and int(m.group(1)) >= 100, a
+
+
+def test_skill_ratios_step_computes_what_get_key_ratios_lacks():
+    step3 = _skill_body().split("\n3.", 1)[1].split("\n4.", 1)[0]
+    sentence = " ".join(step3.split("get_key_ratios", 1)[1].split())
+    for term in ("growth", "CAGR", "net debt", "share-count change"):
+        assert term in sentence, term
+    assert "always" in sentence.lower()
+
+
+def test_skill_insiders_step_reports_covered_window_when_capped():
+    step7 = " ".join(_skill_body().split("\n7.", 1)[1].split("\n8.", 1)[0].split())
+    assert "filings_capped" in step7 and "covered_since" in step7
