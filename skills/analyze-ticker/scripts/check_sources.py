@@ -68,14 +68,20 @@ NON_FINANCIAL_PATTERNS = [
         re.IGNORECASE,
     ),
     re.compile(r"\((?:19|20)\d{2}\)"),  # "(2025)"
-    # Month and day without a year, e.g. a fiscal year end "June 30". Capitalized month
-    # names only, so the verb "may" before a number is not taken for a date.
+    # Month and day without a year, e.g. a fiscal year end "June 30". Exempt only when the
+    # day ends the phrase (end of line, ",", ";", "(", ")" or a sentence-ending "."), so
+    # "June 30 bn" or "May 15 million" still count as numbers. Capitalized month names
+    # only, so the verb "may" before a number is not taken for a date.
     re.compile(
         r"\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|June?|July?|Aug(?:ust)?|"
-        r"Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+\d{1,2}\b"
-        r"(?![\d%]|[.,]\d|\s?[BMK]\b)"
+        r"Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+\d{1,2}"
+        r"(?=\s*(?:$|[,;()]|\.(?:\s|$)))"
     ),
-    re.compile(r"(?<![$\d.,])\b(?:3|6|9)M\s+YTD\b"),  # year-to-date labels: 9M YTD
+    # Year-to-date period labels ("9M YTD") only as a label: at the line start, in
+    # parentheses or after a function word. "Net loss 3M YTD" or "EUR 9M YTD" still count.
+    re.compile(
+        r"(?:^|\(|\b(?:the|in|for|over|from|minus|and)\s+)(?:3|6|9)M\s+YTD\b", re.IGNORECASE
+    ),
     re.compile(r"\b10b5-1\b", re.IGNORECASE),  # SEC Rule 10b5-1
 ]
 
@@ -200,7 +206,9 @@ def check_text(text: str) -> list[Problem]:
         if sec == "heading":
             # Years in headings are fine; other numbers in headings still need a source.
             # Leave ISO dates intact for NON_FINANCIAL_PATTERNS ("2026-09-01" is a date).
-            check_line = re.sub(r"(?<![\d-])\b(?:19|20)\d{2}\b(?!-\d)", " ", raw)
+            # Year ranges ("2021-2025") go first, then single years outside ISO dates.
+            check_line = re.sub(r"\b(?:19|20)\d{2}\s*[-–]\s*(?:19|20)\d{2}\b(?!-\d)", " ", raw)
+            check_line = re.sub(r"(?<![\d-])\b(?:19|20)\d{2}\b(?!-\d)", " ", check_line)
         if not has_financial_number(check_line):
             continue
         if URL_RE.search(raw):

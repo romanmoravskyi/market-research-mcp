@@ -198,7 +198,7 @@ def test_review_every_unresolved_ref_reported():  # finding 8
         "Fiscal year ends June 30.",  # the skill asks to state a non-December year end
         "Fiscal year ends September 30 (fiscal 2026 = October 2025 to September 2026).",
         "Q4 flows marked derived are FY minus 9M YTD.",  # the tool's own period label
-        "Quarters use 6M YTD and 9M YTD facts.",
+        "Quarters use the 6M YTD and 9M YTD facts.",
     ],
 )
 def test_e2e_dates_and_period_labels_not_flagged(line):
@@ -216,3 +216,36 @@ def test_e2e_dates_and_period_labels_not_flagged(line):
 def test_e2e_money_next_to_dates_still_flagged(line):
     out = reasons(doc(line + "\n"))
     assert len(out) == 1, out
+
+
+# PR #9 review: exempt only exact date or period tokens, never a number next to a unit.
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Revenue June 30 bn",  # finding 1
+        "Buyback in May 15 million shares",  # finding 1
+        "June 30 bn",
+        "Opex of €9M YTD",  # finding 6
+        "Net loss 3M YTD",  # finding 6
+        "Revenue 9M YTD",
+    ],
+)
+def test_review9_amounts_next_to_date_or_period_tokens_flagged(line):
+    out = reasons(doc(line + "\n"))
+    assert len(out) == 1, out
+    assert "without source" in out[0]
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "## Revenue 2021-2025",  # finding 2
+        "## Revenue 2021 - 2025 (FY2021 to FY2025)",
+        "Fiscal year ends June 30, per the 10-K.",
+        "Derived quarters (9M YTD) are FY minus the 9M YTD figure.",
+    ],
+)
+def test_review9_exact_date_and_period_tokens_pass(line):
+    assert reasons(doc(line + "\n")) == []

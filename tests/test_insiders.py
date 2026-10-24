@@ -8,7 +8,7 @@ because the recorded MSFT filings contain no derivative transactions.
 import gzip
 import json
 import re
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import httpx
@@ -21,6 +21,7 @@ from market_research_mcp.cache import Cache
 from market_research_mcp.errors import BadInput
 from market_research_mcp.ratelimit import reset_limiters
 from market_research_mcp.sources import edgar, insiders
+from market_research_mcp.sources.edgar import Filing
 
 SEC = Path(__file__).parent / "fixtures" / "sec"
 FORM4 = SEC / "form4"
@@ -466,13 +467,34 @@ async def test_live_msft_insiders():
 
 async def test_capped_result_states_the_window_the_summary_covers(sec, monkeypatch):
     # A capped call fetches only the newest filings, so "since" overstates coverage. The
-    # response must say from which filing date the summary is complete.
+    # response must say from which day the summary is complete.
     monkeypatch.setattr(insiders, "MAX_FILINGS", 3)
     res = await insiders.get_insider_transactions("MSFT")
     oldest = min(r.filing_date for r in res.items)
-    assert res.covered_since == oldest
+    assert res.covered_since in (oldest, oldest + timedelta(days=1))
     assert res.covered_since > res.since
-    assert any(f"covers filings from {oldest.isoformat()}" in n for n in res.notes)
+    assert any(f"covers filings from {res.covered_since.isoformat()}" in n for n in res.notes)
+
+
+def _f(day: str, n: int) -> Filing:
+    return Filing(form="4", filing_date=date.fromisoformat(day), accession=f"0000000001-26-{n:06d}")
+
+
+def test_covered_since_skips_a_partially_fetched_boundary_day():
+    # Review finding 3: kept #2 and cut #3 share 2026-03-15, so that day is incomplete.
+    filings = [_f("2026-03-20", 1), _f("2026-03-15", 2), _f("2026-03-15", 3), _f("2026-03-01", 4)]
+    since = date(2026, 1, 1)
+    assert insiders.covered_since(filings, 2, since) == date(2026, 3, 16)
+
+
+def test_covered_since_keeps_boundary_day_when_cut_filing_is_older():
+    filings = [_f("2026-03-20", 1), _f("2026-03-15", 2), _f("2026-03-14", 3)]
+    assert insiders.covered_since(filings, 2, date(2026, 1, 1)) == date(2026, 3, 15)
+
+
+def test_covered_since_is_since_when_not_capped():
+    filings = [_f("2026-03-20", 1), _f("2026-03-15", 2)]
+    assert insiders.covered_since(filings, 2, date(2026, 1, 1)) == date(2026, 1, 1)
 
 
 async def test_uncapped_result_covers_since(sec):

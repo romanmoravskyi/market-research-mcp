@@ -4,6 +4,7 @@ To add a data source, create `sources/<name>.py` with `register` and add one lin
 
 from __future__ import annotations
 
+import importlib
 import logging
 
 from mcp.server.fastmcp import FastMCP
@@ -48,21 +49,31 @@ def build_server() -> FastMCP:
     return mcp
 
 
-def _preload_native_libraries() -> None:
-    """Load numpy before the stdio transport starts.
+# Modules the tools import lazily (inside functions). tests/test_server_startup.py fails if
+# a new lazy import is not listed here. Optional ones are skipped when not installed.
+PRELOAD_MODULES = ("edgar.company_reports", "edgar.documents", "yfinance")
 
-    On Windows, numpy's first import (it loads native DLLs) deadlocks while the transport
-    has a blocking read pending on stdin. edgartools imports numpy lazily inside a worker
-    thread, so get_filing_section and get_filing_exhibit hung until the client timed out.
-    Importing it here costs well under a second.
+
+def _preload_lazy_imports() -> None:
+    """Import every lazily imported module before the stdio transport starts.
+
+    On Windows the transport keeps a synchronous blocking read pending on stdin. Loading a
+    native extension DLL for the first time (edgartools pulls in numpy, pandas, pyarrow and
+    others) runs the DLL's C runtime start-up, which queries the standard handles and waits
+    behind that read: the tool call hangs until the client times out. Doing the imports here,
+    before any read is pending, avoids it. Costs about 4 s of startup, once.
     """
-    import numpy  # noqa: F401
+    for name in PRELOAD_MODULES:
+        try:
+            importlib.import_module(name)
+        except ImportError:
+            logger.debug("optional module %s not installed; not preloaded", name)
 
 
 def main() -> None:
     settings = load_settings()
     setup_logging(settings.log_level)
-    _preload_native_libraries()
+    _preload_lazy_imports()
     mcp = build_server()
     logger.info("Starting %s over stdio", SERVER_NAME)
     mcp.run(transport="stdio")

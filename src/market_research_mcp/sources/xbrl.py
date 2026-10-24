@@ -766,6 +766,36 @@ def _cover(
     return None
 
 
+# Fallback tags that measure something different from the metric's primary tag.
+TAG_CAVEATS = {
+    "NetIncomeLossAvailableToCommonStockholdersBasic": (
+        "net income available to common stockholders, after preferred dividends; not the "
+        "same measure as NetIncomeLoss"
+    ),
+}
+
+
+def mixed_tag_notes(values: list[FundamentalValue]) -> list[str]:
+    """One note per metric whose series uses more than one tag (tags differ by period)."""
+    notes: list[str] = []
+    by_metric: dict[str, dict[str, list[date]]] = {}
+    for v in values:
+        if v.tag and v.value is not None:
+            by_metric.setdefault(v.metric, {}).setdefault(v.tag, []).append(v.period_end)
+    for metric, tags in by_metric.items():
+        if len(tags) < 2:
+            continue
+        parts = []
+        for tag, ends in tags.items():
+            caveat = f": {TAG_CAVEATS[tag]}" if tag in TAG_CAVEATS else ""
+            parts.append(f"{tag} for periods ending {min(ends)} to {max(ends)}{caveat}")
+        notes.append(
+            f"{metric} mixes XBRL tags across periods: {'; '.join(parts)}. Each value's `tag` "
+            "says which; compare values only within one tag. Derived quarters never mix tags."
+        )
+    return notes
+
+
 # ---------------------------------------------------------------- tool
 
 
@@ -810,7 +840,7 @@ async def get_fundamentals(
     splits = detect_splits(facts)
     values = normalize(facts, cik=company.cik, metrics=names, periods=periods, n=n, splits=splits)
     filed = [v.filed for v in values if v.filed is not None]
-    notes = list(NOTES)
+    notes = list(NOTES) + mixed_tag_notes(values)
     if periods == "quarterly":
         notes.append(
             "Quarterly values are 3-month facts where reported. Missing quarters of USD flow "

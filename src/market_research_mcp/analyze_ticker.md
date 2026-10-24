@@ -18,10 +18,13 @@ Read-only research. The user makes every investment decision.
 2. `get_fundamentals(ticker, metrics=[revenue, net_income, diluted_eps, operating_cash_flow,
    capex, total_debt, cash, shares_diluted], periods="annual", n=5)`, then the same with
    `periods="quarterly", n=8`. Keep XBRL tag, period start/end and filed date per value.
+   If a note says a metric mixes XBRL tags, say so next to the affected rows and do not
+   compute growth or CAGR across the tag switch.
 3. Ratios: margins, revenue growth YoY and 3y CAGR, FCF, net debt, share-count change. Use
    `get_key_ratios(ticker)` if the server lists it for margins, ROE, ROA, debt/equity, current
-   ratio and FCF margin. It does not return revenue growth, CAGR, net debt or share-count
-   change, so always compute those from the step 2 `get_fundamentals` values. Without
+   ratio and FCF margin. It does not return revenue growth, CAGR, FCF (operating_cash_flow -
+   capex), net debt or share-count change, so always compute those from the step 2
+   `get_fundamentals` values. Without
    `get_key_ratios`, compute all ratios from the step 2 `get_fundamentals` values. Show the
    formula and inputs for each computed ratio (e.g. "FCF = operating_cash_flow - capex = $X -
    $Y"), citing the same sources. If an input is null, the ratio is "n/a" with that reason.
